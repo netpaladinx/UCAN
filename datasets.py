@@ -144,7 +144,7 @@ class Dataset(object):
 
 
 class YAGO310(Dataset):
-    path = 'data/YAGO3-10'
+    path = 'data/kbc/YAGO3-10'
 
     def __init__(self):
         train_path = os.path.join(self.path, 'train')
@@ -154,7 +154,7 @@ class YAGO310(Dataset):
 
 
 class Countries(Dataset):
-    path = 'data/countries'
+    path = 'data/MINERVA/countries'
 
     def __init__(self, subname='_S1'):
         self.path = Countries.path + subname

@@ -5,23 +5,24 @@ from tensorflow.python.keras.api._v2 import keras
 
 
 class F(keras.layers.Layer):
-    def __init__(self, interact, n_dims, use_bias=True, activation=None, output_weight=False, output_bias=False):
-        super(F, self).__init__()
+    def __init__(self, interact, n_dims, use_bias=True, activation=None, output_weight=False, output_bias=False, name=None):
+        super(F, self).__init__(name=name)
         self.interact = interact
+        self.n_dims = n_dims
         self.use_bias = use_bias
         self.activation = activation
         self.output_weight = output_weight
         self.output_bias = output_bias
 
+    def build(self, input_shape):
         n_ws = len(self.interact)
-        self.ws = self.add_weight(shape=(n_ws, n_dims), initializer=keras.initializers.VarianceScaling())
+        self.ws = self.add_weight(shape=(n_ws, self.n_dims), initializer=keras.initializers.VarianceScaling(), name='ws')
         if self.use_bias:
-            self.b = self.add_weight(shape=(n_dims,), initializer=keras.initializers.zeros())
-
+            self.b = self.add_weight(shape=(self.n_dims,), initializer=keras.initializers.zeros(), name='b')
         if self.output_weight:
-            self.out_w = self.add_weight(shape=(n_dims,), initializer=keras.initializers.VarianceScaling())
+            self.out_w = self.add_weight(shape=(self.n_dims,), initializer=keras.initializers.VarianceScaling(), name='out_w')
         if self.output_bias:
-            self.out_b = self.add_weight(shape=(n_dims,), initializer=keras.initializers.zeros())
+            self.out_b = self.add_weight(shape=(self.n_dims,), initializer=keras.initializers.zeros(), name='out_b')
 
     def call(self, inputs, training=None):
         """ inputs[i]: bs x ... x n_dims
@@ -46,13 +47,19 @@ class F(keras.layers.Layer):
 
 
 class G(keras.layers.Layer):
-    def __init__(self, n_dims, use_bias=True, activation=None, output_weight=False, output_bias=False, residual=True):
-        super(G, self).__init__()
+    def __init__(self, n_dims, use_bias=True, activation=None, output_weight=False, output_bias=False, residual=True, name=None):
+        super(G, self).__init__(name=name)
+        self.n_dims = n_dims
+        self.use_bias = use_bias
+        self.activation = activation
+        self.output_bias = output_bias
         self.output_weight = output_weight
         self.residual = residual
-        self.dense = keras.layers.Dense(n_dims, activation=activation, use_bias=use_bias)
+
+    def build(self, input_shape):
+        self.dense = keras.layers.Dense(self.n_dims, activation=self.activation, use_bias=self.use_bias, name='den')
         if self.output_weight:
-            self.dense_out = keras.layers.Dense(n_dims, use_bias=output_bias)
+            self.dense_out = keras.layers.Dense(self.n_dims, use_bias=self.output_bias, name='out')
 
     def call(self, inputs, training=None):
         outputs = self.dense(inputs)
@@ -141,9 +148,11 @@ class Normalize(keras.layers.Layer):
 
 class Sampler(keras.Model):
     def __init__(self, graph):
-        super(Sampler, self).__init__()
-        self.edges_p = self.add_weight(shape=(graph.n_full_edges,),
-                                       initializer=keras.initializers.constant(self._initialize(graph)))
+        super(Sampler, self).__init__(name='sampler')
+        with tf.name_scope(self.name):
+            self.edges_p = self.add_weight(shape=(graph.n_full_edges,),
+                                           initializer=keras.initializers.constant(self._initialize(graph)),
+                                           name='edges_p')
 
     def _initialize(self, graph):
         p_init = np.zeros((graph.n_full_edges,), np.float32)
@@ -216,31 +225,30 @@ class UnconsciousnessFlow(keras.Model):
         """ n_entities: including virtual nodes
             n_relations: including 'virtual' but not 'selfloop' and 'backtrace'
         """
-        super(UnconsciousnessFlow, self).__init__()
+        super(UnconsciousnessFlow, self).__init__(name='uncon_flow')
         self.n_nodes = n_entities
         self.n_dims = n_dims
 
         self.entity_embedding = keras.layers.Embedding(n_entities, self.n_dims,
-                                                       embeddings_regularizer=keras.regularizers.l2(l2_factor))
+                                                       embeddings_regularizer=keras.regularizers.l2(l2_factor),
+                                                       name='entities')
         self.relation_embedding = keras.layers.Embedding(n_relations, self.n_dims,
-                                                         embeddings_regularizer=keras.regularizers.l2(l2_factor))
+                                                         embeddings_regularizer=keras.regularizers.l2(l2_factor),
+                                                         name='relations')
 
         # f(message_aggr, hidden, ent_emb)
         self.f_hidden = F([[0], [0, 1], [0, 2], [1], [2], [1, 2]], self.n_dims,
-                          activation=tf.nn.relu, output_weight=True, output_bias=True)
-        self.g_hidden = G(self.n_dims, activation=tf.nn.relu, output_weight=True, output_bias=True)
-
-        self.nodes_to_edges = N2E()
+                          activation=tf.nn.relu, output_weight=True, output_bias=True, name='f_hidden')
+        self.g_hidden = G(self.n_dims, activation=tf.nn.relu, output_weight=True, output_bias=True, name='g_hidden')
 
         # f(hidden_vi, rel_emb, hidden_vj)
         self.f_message = F([[0], [0, 1], [0, 1, 2]], self.n_dims,
-                           activation=tf.nn.relu, output_weight=True, output_bias=True)
-        self.g_message = G(self.n_dims, activation=tf.nn.relu, output_weight=True, output_bias=True)
+                           activation=tf.nn.relu, output_weight=True, output_bias=True, name='f_msg')
+        self.g_message = G(self.n_dims, activation=tf.nn.relu, output_weight=True, output_bias=True, name='g_msg')
+
+        self.nodes_to_edges = N2E()
 
         self.aggregate = Aggregate()
-
-        ent_idx = tf.expand_dims(tf.range(0, self.n_nodes), axis=0)  # 1 x n_nodes
-        self.ent_emb = self.entity_embedding(ent_idx)  # 1 x n_nodes x n_dims
 
     def call(self, inputs, selected_edges=None, edges_y=None, training=None):
         """ inputs (hidden): 1 x n_nodes x n_dims
@@ -250,6 +258,9 @@ class UnconsciousnessFlow(keras.Model):
         """
         assert selected_edges is not None
         assert edges_y is not None
+
+        ent_idx = tf.expand_dims(tf.range(0, self.n_nodes), axis=0)  # 1 x n_nodes
+        ent_emb = self.entity_embedding(ent_idx)  # 1 x n_nodes x n_dims
 
         # compute unconscious messages
         hidden = inputs
@@ -265,15 +276,19 @@ class UnconsciousnessFlow(keras.Model):
                                       output_shape=(1, self.n_nodes, self.n_dims))
 
         # update unconscious states
-        update = self.f_hidden((message_aggr, hidden, self.ent_emb))  # 1 x n_nodes x n_dims
+        update = self.f_hidden((message_aggr, hidden, ent_emb))  # 1 x n_nodes x n_dims
         update = self.g_hidden(update)
         hidden = hidden + update
         return hidden  # 1 x n_nodes x n_dims
 
     def get_initial_hidden(self):
-        zeros = tf.zeros((1, self.n_nodes, self.n_dims))  # 1 x n_nodes x n_dims
-        hidden_init = self.f_hidden((zeros, zeros, self.ent_emb))
-        hidden_init = self.g_hidden(hidden_init)
+        with tf.name_scope(self.name):
+            ent_idx = tf.expand_dims(tf.range(0, self.n_nodes), axis=0)  # 1 x n_nodes
+            ent_emb = self.entity_embedding(ent_idx)  # 1 x n_nodes x n_dims
+
+            zeros = tf.zeros((1, self.n_nodes, self.n_dims))  # 1 x n_nodes x n_dims
+            hidden_init = self.f_hidden((zeros, zeros, ent_emb))
+            hidden_init = self.g_hidden(hidden_init)
         return hidden_init  # 1 x n_nodes x n_dims
 
 
@@ -282,37 +297,36 @@ class ConsciousnessFlow(keras.Model):
         """ n_entities: including virtual nodes
             n_relations: including 'virtual', 'selfloop' and 'backtrace'
         """
-        super(ConsciousnessFlow, self).__init__()
+        super(ConsciousnessFlow, self).__init__(name='con_flow')
         self.n_nodes = n_entities
         self.n_dims = n_dims
 
         self.entity_embedding = keras.layers.Embedding(n_entities, self.n_dims,
-                                                       embeddings_regularizer=keras.regularizers.l2(l2_factor))
+                                                       embeddings_regularizer=keras.regularizers.l2(l2_factor),
+                                                       name='entitys')
         self.relation_embedding = keras.layers.Embedding(n_relations, self.n_dims,
-                                                         embeddings_regularizer=keras.regularizers.l2(l2_factor))
+                                                         embeddings_regularizer=keras.regularizers.l2(l2_factor),
+                                                         name='relations')
 
         # f(head_emb, rel_emb)
         self.f_query = F([[0], [1], [0,1]], self.n_dims,
-                         activation=tf.nn.relu, output_weight=True, output_bias=True)
-        self.g_query = G(self.n_dims, activation=tf.nn.relu, output_weight=True, output_bias=True)
+                         activation=tf.nn.relu, output_weight=True, output_bias=True, name='f_query')
+        self.g_query = G(self.n_dims, activation=tf.nn.relu, output_weight=True, output_bias=True, name='g_query')
 
         # f(message, hidden_uncon, hidden, ent_emb)
         self.f_hidden = F([[0], [0, 2], [0, 3], [1], [1, 2], [1, 3], [2], [3], [2, 3]], self.n_dims,
-                          activation=tf.nn.relu, output_weight=True, output_bias=True)
-        self.g_hidden = G(self.n_dims, activation=tf.nn.relu, output_weight=True, output_bias=True)
-
-        ent_idx = tf.expand_dims(tf.range(0, self.n_nodes), axis=0)  # 1 x n_nodes
-        self.ent_emb = self.entity_embedding(ent_idx)  # 1 x n_nodes x n_dims
-
-        self.nodes_to_edges = N2E()
+                          activation=tf.nn.relu, output_weight=True, output_bias=True, name='f_hidden')
+        self.g_hidden = G(self.n_dims, activation=tf.nn.relu, output_weight=True, output_bias=True, name='g_hidden')
 
         # f(hidden_vi, rel_emb, hidden_vj)
         self.f_message = F([[0], [0, 1], [0, 1, 2]], self.n_dims,
-                           activation=tf.nn.relu, output_weight=True, output_bias=True)
-        self.g_message = G(self.n_dims, activation=tf.nn.relu, output_weight=True, output_bias=True)
+                           activation=tf.nn.relu, output_weight=True, output_bias=True, name='f_msg')
+        self.g_message = G(self.n_dims, activation=tf.nn.relu, output_weight=True, output_bias=True, name='g_msg')
 
         # f(trans_attention, message)
-        self.f_attended_message = F([[0, 1]], self.n_dims, use_bias=False)
+        self.f_attended_message = F([[0, 1]], self.n_dims, use_bias=False, name='f_att_msg')
+
+        self.nodes_to_edges = N2E()
 
         self.aggregate = Aggregate()
 
@@ -333,6 +347,9 @@ class ConsciousnessFlow(keras.Model):
         assert node_attention is not None
         assert hidden_uncon is not None
 
+        ent_idx = tf.expand_dims(tf.range(0, self.n_nodes), axis=0)  # 1 x n_nodes
+        ent_emb = self.entity_embedding(ent_idx)  # 1 x n_nodes x n_dims
+
         # compute conscious messages
         hidden = inputs
         hidden_vi, hidden_vj = self.nodes_to_edges(hidden, selected_edges)  # n_selected_edges x n_dims
@@ -352,7 +369,7 @@ class ConsciousnessFlow(keras.Model):
 
         # update conscious messages
         hidden_uncon = hidden_uncon * tf.expand_dims(node_attention, 2)  # batch_size x n_nodes x n_dims
-        ent_emb = tf.tile(self.ent_emb, [batch_size, 1, 1])  # batch_size x n_nodes x n_dims
+        ent_emb = tf.tile(ent_emb, [batch_size, 1, 1])  # batch_size x n_nodes x n_dims
         update = self.f_hidden((message_aggr, hidden_uncon, hidden, ent_emb))  # batch_size x n_nodes x n_dims
         update = self.g_hidden(update)
         hidden = hidden + update
@@ -362,10 +379,11 @@ class ConsciousnessFlow(keras.Model):
         """ heads: batch_size
             rels: batch_size
         """
-        head_emb = self.entity_embedding(heads)  # batch_size x n_dims
-        rel_emb = self.relation_embedding(rels)  # batch_size x n_dims
-        query_context = self.f_query((head_emb, rel_emb))
-        query_context = self.g_query(query_context)
+        with tf.name_scope(self.name):
+            head_emb = self.entity_embedding(heads)  # batch_size x n_dims
+            rel_emb = self.relation_embedding(rels)  # batch_size x n_dims
+            query_context = self.f_query((head_emb, rel_emb))
+            query_context = self.g_query(query_context)
         return query_context  # batch_size x n_dims
 
     def get_initial_hidden(self, query_context, hidden_uncon, node_attention):
@@ -373,28 +391,32 @@ class ConsciousnessFlow(keras.Model):
             hidden_uncon: 1 x n_nodes x n_dims
             node_attention: batch_size x n_nodes
         """
-        batch_size = tf.shape(query_context)[0]
-        message = tf.expand_dims(query_context, 1) * tf.expand_dims(node_attention, 2)  # batch_size x n_nodes x n_dims
-        hidden_uncon = hidden_uncon * tf.expand_dims(node_attention, 2)  # batch_size x n_nodes x n_dims
-        zeros = tf.zeros_like(hidden_uncon)  # batch_size x n_nodes x n_dims
-        ent_emb = tf.tile(self.ent_emb, [batch_size, 1, 1])  # batch_size x n_nodes x n_dims
-        hidden_init = self.f_hidden((message, hidden_uncon, zeros, ent_emb))
-        hidden_init = self.g_hidden(hidden_init)
+        with tf.name_scope(self.name):
+            ent_idx = tf.expand_dims(tf.range(0, self.n_nodes), axis=0)  # 1 x n_nodes
+            ent_emb = self.entity_embedding(ent_idx)  # 1 x n_nodes x n_dims
+
+            batch_size = tf.shape(query_context)[0]
+            message = tf.expand_dims(query_context, 1) * tf.expand_dims(node_attention, 2)  # batch_size x n_nodes x n_dims
+            hidden_uncon = hidden_uncon * tf.expand_dims(node_attention, 2)  # batch_size x n_nodes x n_dims
+            zeros = tf.zeros_like(hidden_uncon)  # batch_size x n_nodes x n_dims
+            ent_emb = tf.tile(ent_emb, [batch_size, 1, 1])  # batch_size x n_nodes x n_dims
+            hidden_init = self.f_hidden((message, hidden_uncon, zeros, ent_emb))
+            hidden_init = self.g_hidden(hidden_init)
         return hidden_init  # batch_size x n_nodes x n_dims
 
 
 class AttentionFlow(keras.Model):
     def __init__(self, n_entities, n_relations, n_dims, l2_factor):
-        super(AttentionFlow, self).__init__()
+        super(AttentionFlow, self).__init__(name='att_flow')
         self.n_nodes = n_entities
         self.n_dims = n_dims
 
         self.relation_embedding = keras.layers.Embedding(n_relations, self.n_dims,
-                                                         embeddings_regularizer=keras.regularizers.l2(l2_factor))
-
+                                                         embeddings_regularizer=keras.regularizers.l2(l2_factor),
+                                                         name='relations')
         # f(hidden_con_vi, rel_emb, hidden_con_vj, hidden_uncon_vj)
         self.f_transition = F([[0, 2], [0, 1, 2], [0, 3], [0, 1, 3]], self.n_dims,
-                              activation=tf.nn.relu, output_weight=True, output_bias=True)
+                              activation=tf.nn.relu, output_weight=True, output_bias=True, name='f_trans')
 
         self.nodes_to_edges = N2E()
 
@@ -445,8 +467,9 @@ class AttentionFlow(keras.Model):
         return trans_attention, new_node_attention
 
     def get_initial_node_attention(self, heads):
-        node_attention = tf.one_hot(heads, self.n_nodes)  # batch_size x n_nodes
-        return node_attention
+        with tf.name_scope(self.name):
+            node_attention = tf.one_hot(heads, self.n_nodes)  # batch_size x n_nodes
+            return node_attention
 
 
 class Model(object):
