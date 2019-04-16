@@ -143,6 +143,16 @@ class Dataset(object):
         print()
 
 
+class FB237(Dataset):
+    path = 'data/kbc/FB237'
+
+    def __init__(self):
+        train_path = os.path.join(self.path, 'train')
+        valid_path = os.path.join(self.path, 'valid')
+        test_path = os.path.join(self.path, 'test')
+        super(FB237, self).__init__(train_path, valid_path, test_path, include_reverse=True)
+
+
 class YAGO310(Dataset):
     path = 'data/kbc/YAGO3-10'
 

@@ -1,30 +1,33 @@
-import sys
 import argparse
 import copy
+import time
+from collections import defaultdict
 
 import numpy as np
 import tensorflow as tf
 from tensorflow.python.keras.api._v2 import keras
 
-from model import Model
-from data_env import DataEnv
+from efficient_model_2 import Model
+from efficient_data_env_2 import DataEnv
 import datasets
 
 parser = argparse.ArgumentParser()
-parser.add_argument('-bs', '--batch_size', type=int, default=30)
+parser.add_argument('-bs', '--batch_size', type=int, default=20)
 parser.add_argument('--n_dims', type=int, default=50)
-parser.add_argument('--l2_factor', type=float, default=0.001)
-parser.add_argument('--max_sampled_edges', type=int, default=1000)
-parser.add_argument('--max_attended_nodes', type=int, default=100)
-parser.add_argument('--max_attended_edges', type=int, default=100)
-parser.add_argument('--max_backtrace_edges', type=int, default=100)
-parser.add_argument('--backtrace_decay', type=float, default=0.9)
+parser.add_argument('--ent_emb_l2', type=float, default=0.001)
+parser.add_argument('--rel_emb_l2', type=float, default=0.)
+parser.add_argument('--max_sampled_edges', type=int, default=10000)
+parser.add_argument('--max_attended_nodes', type=int, default=500)
+parser.add_argument('--max_attended_edges', type=int, default=2000)
+parser.add_argument('--max_backtrace_edges', type=int, default=500)
+parser.add_argument('--backtrace_decay', type=float, default=1.)
 parser.add_argument('--max_epochs', type=int, default=10)
-parser.add_argument('--n_virtual_nodes', type=int, default=100)
+parser.add_argument('--n_virtual_nodes', type=int, default=10)
 parser.add_argument('--init_uncon_steps', type=int, default=5)
 parser.add_argument('--max_steps', type=int, default=5)
 parser.add_argument('--learning_rate', type=float, default=0.001)
 parser.add_argument('--dataset', default='Countries')
+parser.add_argument('--timer', action='store_false')
 default_hparams = parser.parse_args()
 
 
@@ -38,25 +41,39 @@ class Trainer(object):
         self.train_pred_loss = keras.metrics.Mean(name='train_pred_loss')
         self.train_accuracy = keras.metrics.SparseCategoricalAccuracy(name='train_accuracy')
 
-    def train_step(self, heads, rels, tails):
+    def train_step(self, heads, rels, tails, time_cost=None):
         with tf.GradientTape() as tape:
             hidden_uncon, hidden_con, node_attention = \
-                self.model.initialize(heads, rels, init_uncon_steps=self.hparams.init_uncon_steps)
+                self.model.initialize(heads, rels, init_uncon_steps=self.hparams.init_uncon_steps,
+                                      time_cost=time_cost)
             for step in range(1, self.hparams.max_steps + 1):
                 hidden_uncon, hidden_con, node_attention = \
-                    self.model.flow(hidden_uncon, hidden_con, node_attention, step, stop_uncon_steps=False)
+                    self.model.flow(hidden_uncon, hidden_con, node_attention, step, stop_uncon_steps=False,
+                                    time_cost=time_cost)
 
             predictions = node_attention
             pred_loss = self.loss_fn(predictions, tails)
             reg_loss = self.model.regularization_loss
             loss = pred_loss + reg_loss
 
+        if time_cost is not None:
+            t0 = time.time()
         gradients = tape.gradient(loss, self.model.trainable_variables)
+        if time_cost is not None:
+            time_cost['grad']['comp'] += time.time() - t0
+
+        if time_cost is not None:
+            t0 = time.time()
         self.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
+        if time_cost is not None:
+            time_cost['grad']['apply'] += time.time() - t0
 
         self.train_loss(loss)
         self.train_pred_loss(pred_loss)
         self.train_accuracy(tails, predictions)
+
+        accuracy = tf.reduce_mean(tf.cast(tf.equal(tf.argmax(predictions, axis=1), tails), tf.float32))
+        return loss, pred_loss, accuracy
 
     def loss_fn(self, predictions, tails):
         pred_idx = tf.stack([tf.range(0, tf.shape(tails)[0]), tails], axis=1)
@@ -145,6 +162,23 @@ class Evaluator(object):
         return hit_1, hit_3, hit_5, hit_10, mr, mrr
 
 
+def reset_time_cost(hparams):
+    if hparams.timer:
+        return {'model': defaultdict(float), 'graph': defaultdict(float), 'grad': defaultdict(float)}
+    else:
+        return None
+
+
+def str_time_cost(time_cost):
+    if time_cost is not None:
+        model_tc = ', '.join('m.{} {:3f}'.format(k, v) for k, v in time_cost['model'].items())
+        graph_tc = ', '.join('g.{} {:3f}'.format(k, v) for k, v in time_cost['graph'].items())
+        grad_tc = ', '.join('d.{} {:3f}'.format(k, v) for k, v in time_cost['grad'].items())
+        return model_tc + ', ' + graph_tc + ', ' + grad_tc
+    else:
+        return ''
+
+
 def run(dataset, hparams):
     data_env = DataEnv(dataset, hparams)
     model = Model(data_env.graph, hparams)
@@ -161,15 +195,22 @@ def run(dataset, hparams):
 
             batch_i = 1
             for train_batch, batch_size in train_batcher(hparams.batch_size):
-                heads, rels, tails = train_batch[:, 0], train_batch[:, 1], train_batch[:, 2]
-                trainer.train_step(heads, rels, tails)
+                t0 = time.time()
+                time_cost = reset_time_cost(hparams)
 
-                train_loss, train_pred_loss, train_accuracy = trainer.metric_result()
-                print('epoch: {:d} | graph: {:d} | batch: {:d} | '
-                      'train_loss: {:.6f} | pred_loss: {:.6f} | accuracy: {:.6f}'.format(epoch, graph_i, batch_i,
-                                                                                         train_loss.numpy(),
-                                                                                         train_pred_loss.numpy(),
-                                                                                         train_accuracy.numpy()))
+                heads, rels, tails = train_batch[:, 0], train_batch[:, 1], train_batch[:, 2]
+                cur_train_loss, cur_pred_loss, cur_accuracy = trainer.train_step(heads, rels, tails, time_cost=time_cost)
+
+                train_loss, pred_loss, accuracy = trainer.metric_result()
+                dt = time.time() - t0
+
+                print('{:d}, {:d}, {:d} | tr_ls: {:.4f} ({:.4f}) | pr_ls: {:.4f} ({:.4f}) | acc: {:.4f} ({:.4f}) |'
+                      ' t: {:3f} | {}'.format(epoch, graph_i, batch_i,
+                                              train_loss.numpy(), cur_train_loss,
+                                              pred_loss.numpy(), cur_pred_loss,
+                                              accuracy.numpy(), cur_accuracy,
+                                              dt,
+                                              str_time_cost(time_cost)))
                 batch_i += 1
             graph_i += 1
 

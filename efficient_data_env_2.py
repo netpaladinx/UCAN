@@ -1,5 +1,6 @@
 from collections import defaultdict
 from functools import partial
+import time
 
 import numpy as np
 import pandas as pd
@@ -44,8 +45,10 @@ class Graph(object):
         self.edges = None
         self.n_edges = 0
 
-        self.past_transitions = None  # past_transitions[i] = [eg_idx, vi, vj, rel, step]
+        self.past_transitions = None  # past_transitions[i] = [eg_idx, vi, vj, rel, step] (not sorted)
         self.past_trans_attention = None  # past_trans_attention[i] = trans_attention
+
+        self.visited_nodes = None  # visited_nodes[i] = [eg_idx, v] sorted by ed_idx, v
 
     def _add_virtual_edges(self, virtual_nodes, n_ents):
         """ `n_ents`: all real nodes in `train` + `valid` + `test`
@@ -100,10 +103,12 @@ class Graph(object):
         self.edges = self.full_edges
         self.n_edges = len(self.edges)
 
-    def get_selected_edges(self, sampled_edges):
+    def get_selected_edges(self, sampled_edges, tc=None):
         """ `sampled_edges`: n_sampled_edges x 2 ( int32, outputs[i] = (eg_idx, edge_id) )
         """
-        sampled_edges = sampled_edges.numpy()
+        if tc is not None:
+            t0 = time.time()
+
         sorted_idx = np.squeeze(np.argsort(sampled_edges.view('<i4,<i4'), order=['f0', 'f1'], axis=0), 1)
         sorted_idx = np.array(sorted_idx, dtype='int32')
         sampled_edges = sampled_edges[sorted_idx]
@@ -115,11 +120,17 @@ class Graph(object):
         idx_vj = np.expand_dims(np.array(idx_vj, dtype='int32'), 1)
         # selected_edges[i] = [eg_idx, head, tail, rel, idx_vi, idx_vj], sorted by (eg_idx, head, tail))
         selected_edges = np.concatenate((selected_edges, idx_vi, idx_vj), axis=1)
+
+        if tc is not None:
+            tc['sel_e'] += time.time() - t0
         return selected_edges, sorted_idx
 
-    def get_attended_nodes(self, node_attention, max_nodes):
+    def get_attended_nodes(self, node_attention, max_nodes, tc=None):
         """ node_attention: batch_size x n_nodes
         """
+        if tc is not None:
+            t0 = time.time()
+
         node_attention = node_attention.numpy()
         eps = 1e-20
         eps_noise = np.random.uniform(low=0., high=eps, size=node_attention.shape)
@@ -136,20 +147,29 @@ class Graph(object):
         eg_idx = eg_idx[mask]
         vi = sorted_idx[mask]
         attended_nodes = np.stack([eg_idx, vi], axis=1)
+
+        if tc is not None:
+            tc['att_v'] += time.time() - t0
         return attended_nodes  # n_attended_nodes x 2 ( attended_nodes[i] = [eg_idx, vi] )
 
-    def get_attended_edges(self, attended_nodes):
+    def get_attended_edges(self, attended_nodes, tc=None):
         """ attended_nodes: n_attended_nodes x 2 ( attended_nodes[i] = (eg_idx, vi) )
         """
+        if tc is not None:
+            t0 = time.time()
+
         batch_size = np.amax(attended_nodes[:, 0]) + 1
         attended_edges = []
         for eg_idx in range(batch_size):
             attended_vi = attended_nodes[:, 1][attended_nodes[:, 0] == eg_idx]
             mask = np.in1d(self.edges[:, 1], attended_vi)
-            attended_eid = np.sort(self.edges[:, 0][mask])
+            attended_eid = self.edges[:, 0][mask]  # already sorted
             attended_edges.append(np.stack([np.repeat(np.array(eg_idx, dtype='int32'), attended_eid.shape[0]),
                                             attended_eid], axis=1))
         attended_edges = np.concatenate(attended_edges, axis=0)
+
+        if tc is not None:
+            tc['att_e'] += time.time() - t0
         return attended_edges  # n_attended_edges x 2 ( attended_edges[i] = [eg_idx, edge_id], sorted by eg_idx, edge_id )
 
     def reset_past_transitions(self):
@@ -157,11 +177,14 @@ class Graph(object):
         self.past_trans_attention = None  # past_trans_attention[i] = trans_attention
 
     def get_selfloop_and_backtrace(self, attended_nodes, attended_node_attention,
-                                   max_backtrace_edges, step, backtrace_decay=1.):
+                                   max_backtrace_edges, step, tc=None, backtrace_decay=1.):
         """ attended_nodes: n_attended_nodes x 2 ( int32, attended_nodes[i] = (eg_idx, vi) ) )
             attended_node_attention: n_attended_nodes
             step: the current step
         """
+        if tc is not None:
+            t0 = time.time()
+
         eg_idx, vi = attended_nodes[:, 0], attended_nodes[:, 1]
         selfloop_edges = np.stack([eg_idx, vi, vi, np.repeat(np.array(self.selfloop, dtype='int32'), eg_idx.shape[0])],
                                   axis=1)  # (eg_idx, vi, vi, selfloop)
@@ -203,13 +226,18 @@ class Graph(object):
                                                                   1)], axis=1))  # (cur_eg_idx, vj, vi, backtrace)
         backtrace_edges = np.concatenate(backtrace_edges, axis=0)
 
+        if tc is not None:
+            tc['sl_bt'] += time.time() - t0
         return selfloop_edges, backtrace_edges  # (eg_idx, vi, vi, selfloop), (eg_idx, vj, vi, backtrace)
 
-    def get_union_edges(self, selected_edges, selfloope_edges, backtrace_edges):
+    def get_union_edges(self, selected_edges, selfloope_edges, backtrace_edges, tc=None):
         """ selected_edges: n_selected_edges x 6 (eg_idx, vi, vj, rel, idx_vi, idx_vj)
             selfloop_edges: n_selfloop_edges x 4 (eg_idx, vi, vi, selfloop)
             backtrace_edges: n_backtrace_edges x 4 (eg_idx, vj, vi, backtrace)
         """
+        if tc is not None:
+            t0 = time.time()
+
         selected_edges = selected_edges[:, :4]  # (eg_idx, vi, vj, rel)
         n_selected_edges = selected_edges.shape[0]
         if backtrace_edges is None:
@@ -230,14 +258,19 @@ class Graph(object):
         idx_vj = np.expand_dims(np.array(idx_vj, dtype='int32'), 1)
         selected_edges = np.concatenate((selected_edges, idx_vi, idx_vj), axis=1)
 
+        if tc is not None:
+            tc['union_e'] += time.time() - t0
         # selected_edges: n_selected_edges x 6 (eg_idx, vi, vj, rel, idx_vi, idx_vj)
         return selected_edges, new_idx_for_edges_y, rest_idx
 
-    def store_transitions(self, selected_edges, selected_trans_att, step):
+    def store_transitions(self, selected_edges, selected_trans_att, step, tc=None):
         """ selected_edges: n_selected_edges x 6 (eg_idx, vi, vj, rel, idx_vi, idx_vj)
                 (not including selfloope_edges and backtrace_edges)
             selected_trans_att: n_selected_edges
         """
+        if tc is not None:
+            t0 = time.time()
+
         transitions = np.concatenate([selected_edges[:, :4],
                                       np.expand_dims(
                                           np.repeat(np.array(step, dtype='int32'), selected_edges.shape[0]), 1)],
@@ -250,6 +283,125 @@ class Graph(object):
         else:
             self.past_transitions = np.concatenate([self.past_transitions, transitions], axis=0)
             self.past_trans_attention = np.concatenate([self.past_trans_attention, trans_attention], axis=0)
+
+        if tc is not None:
+            tc['st_trans'] += time.time() - t0
+
+    def get_initial_selected_nodes(self, heads, tc=None):
+        """ heads: batch_size
+        """
+        if tc is not None:
+            t0 = time.time()
+
+        batch_size = heads.shape[0]
+        selected_v = np.stack([np.array(np.arange(batch_size), dtype='int32'), heads], axis=1)  # n_selected_nodes (=batch_size) x 2
+
+        if tc is not None:
+            tc['i_sel_v'] += time.time() - t0
+        return selected_v
+
+    def reset_visited_nodes(self, selected_v):
+        """ selected_v: n_selected_nodes (=batch_size) x 2, (idx, v)
+        """
+        self.visited_nodes = selected_v  # n_visited_nodes x 2, (eg_idx, v) sorted by ed_idx, v
+
+    def update_visited_nodes(self, selected_edges, tc=None):
+        """ selected_edges: n_selected_edges (=n_attended_edges) x 6, (idx, vi, vj, rel, idx_vi, idx_vj) sorted by (idx, vi, vj)
+        """
+        if tc is not None:
+            t0 = time.time()
+
+        selected_vj = np.unique(selected_edges[:, [0, 2]], axis=0)
+        mask = np.in1d(selected_vj.view('<i4,<i4'), self.visited_nodes.view('<i4,<i4'), assume_unique=True)
+        mask = np.logical_not(mask)
+        new_nodes = selected_vj[mask]  # n_new_nodes x 2
+        prev_visited_nodes = self.visited_nodes
+        visited_nodes = np.concatenate([prev_visited_nodes, new_nodes], axis=0)  # n_visited_nodes (new) x 2
+        sorted_idx = np.squeeze(np.argsort(visited_nodes.view('<i4,<i4'), order=['f0', 'f1'], axis=0), 1)
+        sorted_idx = np.array(sorted_idx, dtype='int32')
+
+        self.visited_nodes = visited_nodes[sorted_idx]
+        n_visited_nodes = len(self.visited_nodes)
+
+        new_idx = np.array(np.argsort(sorted_idx), dtype='int32')
+        n_previous_nodes = prev_visited_nodes.shape[0]
+        new_idx_for_previous = np.expand_dims(new_idx[:n_previous_nodes], 1)
+        rest_idx = np.expand_dims(new_idx[n_previous_nodes:], 1)
+
+        if tc is not None:
+            tc['up_vis'] += time.time() - t0
+        return new_idx_for_previous, rest_idx, n_visited_nodes
+
+    def index_visited_nodes(self, selected_edges, tc=None):
+        """ selected_edges (aug_selected_edges): n_selected_edges (=n_aug_selected_edges) x 6
+        """
+        if tc is not None:
+            t0 = time.time()
+
+        selected_vi = np.unique(selected_edges[:, [0, 1]], axis=0)
+        selected_vj = np.unique(selected_edges[:, [0, 2]], axis=0)
+        mask_vi = np.in1d(self.visited_nodes.view('<i4,<i4'), selected_vi.view('<i4,<i4'), assume_unique=True)
+        mask_vj = np.in1d(self.visited_nodes.view('<i4,<i4'), selected_vj.view('<i4,<i4'), assume_unique=True)
+        new_idx_e2vi = np.array(np.argwhere(mask_vi), dtype='int32')  # n_selected_by_idx_vi x 1
+        new_idx_e2vj = np.array(np.argwhere(mask_vj), dtype='int32')  # n_selected_by_idx_vj x 1
+
+        idx_vi = selected_edges[:, 4]
+        idx_vj = selected_edges[:, 5]
+        new_idx_e2vi = new_idx_e2vi[idx_vi]  # n_selected_edges x 1
+        new_idx_e2vj = new_idx_e2vj[idx_vj]  # n_selected_edges x 1
+
+        # selected_edges:n_selected_edges x 8, (idx, vi, vj, rel, idx_vi, idx_vj, new_idx_e2vi, new_idx_e2vj) sorted by idx, vi, vj
+        selected_edges = np.concatenate([selected_edges, new_idx_e2vi, new_idx_e2vj], axis=1)
+
+        if tc is not None:
+            tc['idx_vis'] += time.time() - t0
+        return selected_edges
+
+    def sample_edges(self, candidate_edges, edges_logits, max_edges, tc=None):
+        """ candidate_edges: n_candidate_edges x 2, (eg_idx, edge_id)
+            edges_logits: n_full_edges
+        """
+        if tc is not None:
+            t0 = time.time()
+
+        edges_logits = edges_logits.numpy()
+        eg_idx, edge_id = candidate_edges[:, 0], candidate_edges[:, 1]  # n_candidate_edges, n_candidate_edges
+        logits = edges_logits[edge_id]  # n_candidate_edges
+
+        eps = 1e-20
+        loglog_u = - np.log(- np.log(np.random.uniform(size=(len(candidate_edges),)) + eps) + eps)  # n_candidate_edges
+        loglog_u = np.array(loglog_u, dtype='float32')
+        logits = logits + loglog_u
+
+        batch_size = np.amax(eg_idx) + 1
+        y_indices = []
+        sampled_edges = []
+        for t in range(batch_size):
+            mask = (eg_idx == t)
+            y = logits[mask]  # n_candidate_edges_t where eg_idx == t
+            e_id = edge_id[mask]  # n_candidate_edges_t where eg_idx == t
+
+            k = min(max_edges, len(y))
+            iy = np.array(np.argsort(y)[-k:][::-1], dtype='int32')  # n_sampled_edges_t
+            e = e_id[iy]
+            n_e = len(iy)
+            eg = np.repeat(np.array(t, dtype='int32'), n_e)
+            eg_e = np.stack([eg, e], axis=1)  # n_sampled_edges_t x 2
+            eg_iy = np.stack([eg, iy], axis=1)  # n_sampled_edges_t x 2
+
+            y_indices.append(eg_iy)
+            sampled_edges.append(eg_e)
+
+        y_indices = np.concatenate(y_indices, axis=0)
+        sampled_edges = np.concatenate(sampled_edges, axis=0)
+
+        if tc is not None:
+            tc['sample'] += time.time() - t0
+        # loglog_u: n_candidate_edges
+        # y_indices: n_sampled_edges x 2, (eg_idx, idx_for_y)
+        # sampled_edges: n_sampled_edges x 2, (eg_idx, edge_id)
+        return loglog_u, y_indices, sampled_edges
+
 
 class DataFeeder(object):
     def get_train_batch(self, train_data, batch_size, shuffle=True):
