@@ -216,9 +216,10 @@ class Sampler(keras.Model):
     def __init__(self, graph):
         super(Sampler, self).__init__(name='sampler')
         with tf.name_scope(self.name):
-            self.edges_logits = self.add_weight(shape=(graph.n_full_edges,),
-                                                initializer=keras.initializers.constant(self._initialize(graph)),
-                                                name='edges_logits')  # n_full_edges
+            with tf.device('/cpu:0'):
+                self.edges_logits = self.add_weight(shape=(graph.n_full_edges,),
+                                                    initializer=keras.initializers.constant(self._initialize(graph)),
+                                                    name='edges_logits')  # n_full_edges
 
     def _initialize(self, graph):
         logits_init = np.zeros((graph.n_full_edges,), np.float32)
@@ -256,7 +257,10 @@ class Sampler(keras.Model):
             y = self._gumbel_softmax(lg, llu, iy)
             edges_y.append(y)
 
-        edges_y = tf.concat(edges_y, 0)
+        if batch_size > 1:
+            edges_y = tf.concat(edges_y, 0)
+        else:
+            edges_y = edges_y[0]
 
         if tc is not None:
             tc['s.call'] += time.time() - t0

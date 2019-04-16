@@ -12,10 +12,10 @@ from efficient_data_env_2 import DataEnv
 import datasets
 
 parser = argparse.ArgumentParser()
-parser.add_argument('-bs', '--batch_size', type=int, default=20)
+parser.add_argument('-bs', '--batch_size', type=int, default=32)
 parser.add_argument('--n_dims', type=int, default=50)
-parser.add_argument('--ent_emb_l2', type=float, default=0.001)
-parser.add_argument('--rel_emb_l2', type=float, default=0.)
+parser.add_argument('--ent_emb_l2', type=float, default=0.01)
+parser.add_argument('--rel_emb_l2', type=float, default=0.01)
 parser.add_argument('--max_sampled_edges', type=int, default=10000)
 parser.add_argument('--max_attended_nodes', type=int, default=500)
 parser.add_argument('--max_attended_edges', type=int, default=2000)
@@ -25,7 +25,7 @@ parser.add_argument('--max_epochs', type=int, default=10)
 parser.add_argument('--n_virtual_nodes', type=int, default=10)
 parser.add_argument('--init_uncon_steps', type=int, default=5)
 parser.add_argument('--max_steps', type=int, default=5)
-parser.add_argument('--learning_rate', type=float, default=0.001)
+parser.add_argument('--learning_rate', type=float, default=0.01)
 parser.add_argument('--dataset', default='Countries')
 parser.add_argument('--timer', action='store_false')
 default_hparams = parser.parse_args()
@@ -139,7 +139,7 @@ class Evaluator(object):
             mask = np.logical_not(np.isin(sorted_idx, fil))
             sorted_idx = sorted_idx[mask]
 
-            rank = np.where(sorted_idx == head)[0].item() + 1
+            rank = np.where(sorted_idx == tar)[0].item() + 1
 
             if rank <= 1:
                 hit_1 += 1

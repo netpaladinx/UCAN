@@ -5,6 +5,7 @@ import time
 import numpy as np
 import pandas as pd
 
+
 class Graph(object):
     def __init__(self, train_triples, n_virtual_nodes, n_ents, n_rels):
         """ `train_triples`: all (head, rel, tail) in `train`
