@@ -73,22 +73,19 @@ class G(keras.layers.Layer):
         return outputs
 
 
-class ReducedLSTM(keras.layers.Layer):
+class ReducedGRU(keras.layers.Layer):
     def __init__(self, n_dims, name=None):
-        super(ReducedLSTM, self).__init__(n_dims, name=name)
+        super(ReducedGRU, self).__init__(n_dims, name=name)
         self.n_dims = n_dims
 
     def build(self, input_shape):
-        self.forget_gate = keras.layers.Dense(self.n_dims, activation=tf.math.sigmoid, bias_initializer='ones', name='forget')
-        self.input_gate = keras.layers.Dense(self.n_dims, activation=tf.math.sigmoid, bias_initializer='ones', name='input')
+        self.z_gate = keras.layers.Dense(self.n_dims, activation=tf.math.sigmoid, bias_initializer='zeros', name='z_gate')
 
     def call(self, inputs, training=None):
-        past_hidden, init_hidden = inputs
-        both_hidden = tf.concat([past_hidden, init_hidden], -1)
-        f = self.forget_gate(both_hidden)
-        i = self.input_gate(both_hidden)
-        out_hidden = f * past_hidden + i * init_hidden
-        return out_hidden
+        prev_hidden, update = inputs
+        z = self.z_gate(tf.concat([prev_hidden, update], -1))
+        new_hidden = (1 - z) * prev_hidden + z * update
+        return new_hidden
 
 
 class Node2Edge(keras.layers.Layer):
@@ -322,19 +319,19 @@ class UnconsciousnessFlow(keras.Model):
 
         # f(message_aggr, hidden, ent_emb)
         self.f_hidden = F([[0], [0, 1], [0, 2], [1], [2], [1, 2]], self.n_dims,
-                          activation=tf.nn.relu, output_weight=True, output_bias=True, name='f_hidden')
-        self.g_hidden = G(self.n_dims, activation=tf.nn.relu, output_weight=True, output_bias=True, name='g_hidden')
+                          activation=tf.tanh, name='f_hidden')
+        self.g_hidden = G(self.n_dims, activation=tf.tanh, name='g_hidden')
 
         # f(hidden_vi, rel_emb, hidden_vj)
         self.f_message = F([[0], [0, 1], [0, 1, 2]], self.n_dims,
-                           activation=tf.nn.relu, output_weight=True, output_bias=True, name='f_msg')
-        self.g_message = G(self.n_dims, activation=tf.nn.relu, output_weight=True, output_bias=True, name='g_msg')
+                           activation=tf.tanh, name='f_msg')
+        self.g_message = G(self.n_dims, activation=tf.tanh, name='g_msg')
 
         self.nodes_to_edges = Node2Edge()
 
         self.aggregate = Aggregate()
 
-        self.lstm_for_init = ReducedLSTM(self.n_dims, name='lstm_init')
+        self.gru = ReducedGRU(self.n_dims, name='gru')
 
     def call(self, inputs, selected_edges=None, edges_y=None, training=None, tc=None):
         """ inputs (hidden): 1 x n_nodes x n_dims
@@ -366,7 +363,7 @@ class UnconsciousnessFlow(keras.Model):
         # update unconscious states
         update = self.f_hidden((message_aggr, hidden, ent_emb))  # 1 x n_nodes x n_dims
         update = self.g_hidden(update)
-        hidden = hidden + update
+        hidden = self.gru((hidden, update))
 
         if tc is not None:
             tc['u.call'] += time.time() - t0
@@ -381,11 +378,13 @@ class UnconsciousnessFlow(keras.Model):
             ent_emb = self.entity_embedding(ent_idx)  # 1 x n_nodes x n_dims
 
             zeros = tf.zeros((1, self.n_nodes, self.n_dims))  # 1 x n_nodes x n_dims
-            hidden_init = self.f_hidden((zeros, zeros, ent_emb))
-            hidden_init = self.g_hidden(hidden_init)
+            update = self.f_hidden((zeros, zeros if past_hidden is None else past_hidden, ent_emb))
+            update = self.g_hidden(update)
 
             if past_hidden is not None:
-                hidden_init = self.lstm_for_init((past_hidden, hidden_init))
+                hidden_init = self.gru((past_hidden, update))
+            else:
+                hidden_init = update
 
         if tc is not None:
             tc['u.init'] += time.time() - t0
@@ -410,18 +409,18 @@ class ConsciousnessFlow(keras.Model):
 
         # f(head_emb, rel_emb)
         self.f_query = F([[0], [1], [0,1]], self.n_dims,
-                         activation=tf.nn.relu, output_weight=True, output_bias=True, name='f_query')
-        self.g_query = G(self.n_dims, activation=tf.nn.relu, output_weight=True, output_bias=True, name='g_query')
+                         activation=tf.tanh, name='f_query')
+        self.g_query = G(self.n_dims, activation=tf.tanh, name='g_query')
 
         # f(message, hidden_uncon, hidden, ent_emb)
         self.f_hidden = F([[0], [0, 2], [0, 3], [1], [1, 2], [1, 3], [2], [3], [2, 3]], self.n_dims,
-                          activation=tf.nn.relu, output_weight=True, output_bias=True, name='f_hidden')
-        self.g_hidden = G(self.n_dims, activation=tf.nn.relu, output_weight=True, output_bias=True, name='g_hidden')
+                          activation=tf.tanh, name='f_hidden')
+        self.g_hidden = G(self.n_dims, activation=tf.tanh, name='g_hidden')
 
         # f(hidden_vi, rel_emb, hidden_vj)
         self.f_message = F([[0], [0, 1], [0, 1, 2]], self.n_dims,
-                           activation=tf.nn.relu, output_weight=True, output_bias=True, name='f_msg')
-        self.g_message = G(self.n_dims, activation=tf.nn.relu, output_weight=True, output_bias=True, name='g_msg')
+                           activation=tf.tanh, name='f_msg')
+        self.g_message = G(self.n_dims, activation=tf.tanh, name='g_msg')
 
         # f(trans_attention, message)
         self.f_attended_message = F([[0, 1]], self.n_dims, use_bias=False, name='f_att_msg')
@@ -429,6 +428,8 @@ class ConsciousnessFlow(keras.Model):
         self.nodes_to_edges_v2 = Node2Edge_v2()
 
         self.aggregate_v2 = Aggregate_v2()
+
+        self.gru = ReducedGRU(self.n_dims, name='gru')
 
     def call(self, inputs, selected_edges=None, edges_y=None, trans_attention=None, node_attention=None,
              hidden_uncon=None, visited_nodes=None, training=None, tc=None):
@@ -474,7 +475,7 @@ class ConsciousnessFlow(keras.Model):
         hidden_uncon = tf.gather(hidden_uncon, v)  # n_visited_nodes x n_dims
         update = self.f_hidden((message_aggr, hidden_uncon, hidden, v_emb))  # n_visited_nodes x n_dims
         update = self.g_hidden(update)
-        hidden = hidden + update
+        hidden = self.gru((hidden, update))
 
         if tc is not None:
             tc['c.call'] += time.time() - t0

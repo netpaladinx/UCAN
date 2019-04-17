@@ -14,7 +14,7 @@ import datasets
 parser = argparse.ArgumentParser()
 parser.add_argument('-bs', '--batch_size', type=int, default=20)
 parser.add_argument('--n_dims', type=int, default=50)
-parser.add_argument('--ent_emb_l2', type=float, default=0.001)
+parser.add_argument('--ent_emb_l2', type=float, default=0.)
 parser.add_argument('--rel_emb_l2', type=float, default=0.)
 parser.add_argument('--max_sampled_edges', type=int, default=10000)
 parser.add_argument('--max_attended_nodes', type=int, default=200)
@@ -27,9 +27,9 @@ parser.add_argument('--init_uncon_steps_per_graph', type=int, default=10)
 parser.add_argument('--init_uncon_steps_per_batch', type=int, default=2)
 parser.add_argument('--simultaneous_uncon_flow', action='store_true', default=False)
 parser.add_argument('--max_steps', type=int, default=5)
-parser.add_argument('--learning_rate', type=float, default=0.01)
+parser.add_argument('--learning_rate', type=float, default=0.001)
 parser.add_argument('--dataset', default='FB237')
-parser.add_argument('--timer', action='store_false', default=True)
+parser.add_argument('--timer', action='store_true', default=True)
 default_hparams = parser.parse_args()
 
 
@@ -216,6 +216,7 @@ def run(dataset, hparams):
                                               dt,
                                               str_time_cost(time_cost)))
                 batch_i += 1
+
             graph_i += 1
 
         data_env.graph.use_full_edges()
