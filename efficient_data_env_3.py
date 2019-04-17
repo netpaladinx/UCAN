@@ -51,6 +51,9 @@ class Graph(object):
 
         self.visited_nodes = None  # visited_nodes[i] = [eg_idx, v] sorted by ed_idx, v
 
+        self.node_attention_li = None
+        self.attend_nodes_li = None
+
     def _add_virtual_edges(self, virtual_nodes, n_ents):
         """ `n_ents`: all real nodes in `train` + `valid` + `test`
         """
@@ -143,8 +146,7 @@ class Graph(object):
         sorted_idx = np.argsort(-node_attention, axis=1)[:, :max_nodes]
         sorted_idx = np.array(sorted_idx, dtype='int32')
         node_attention = np.take_along_axis(node_attention, sorted_idx, axis=1)  # sorted node attention
-        mask = (node_attention > eps)[:, :max_nodes]
-        mask[:, 0] = True  # top-1 guaranteed
+        mask = (node_attention > 2 * eps)[:, :max_nodes]
         eg_idx = np.repeat(np.expand_dims(np.array(np.arange(batch_size), dtype='int32'), 1), max_nodes, axis=1)
         eg_idx = eg_idx[mask]
         vi = sorted_idx[mask]
@@ -160,7 +162,10 @@ class Graph(object):
         if tc is not None:
             t0 = time.time()
 
-        batch_size = np.amax(attended_nodes[:, 0]) + 1
+        try:
+            batch_size = np.amax(attended_nodes[:, 0]) + 1
+        except ValueError:
+            print(len(attended_nodes))
         attended_edges = []
         for eg_idx in range(batch_size):
             attended_vi = attended_nodes[:, 1][attended_nodes[:, 0] == eg_idx]
@@ -177,6 +182,12 @@ class Graph(object):
     def reset_past_transitions(self):
         self.past_transitions = None  # past_transitions[i] = [eg_idx, vi, vj, rel, step]
         self.past_trans_attention = None  # past_trans_attention[i] = trans_attention
+
+    def reset_node_attention_li(self, node_attention):
+        self.node_attention_li = [node_attention.numpy()]
+
+    def reset_attended_nodes_li(self):
+        self.attend_nodes_li = []
 
     def get_selfloop_and_backtrace(self, attended_nodes, attended_node_attention,
                                    max_backtrace_edges, step, tc=None, backtrace_decay=1.):
@@ -289,6 +300,12 @@ class Graph(object):
         if tc is not None:
             tc['st_trans'] += time.time() - t0
 
+    def store_node_attention(self, node_attention):
+        self.node_attention_li.append(node_attention.numpy())
+
+    def store_attended_nodes(self, attended_nodes):
+        self.attend_nodes_li.append(attended_nodes)
+
     def get_initial_selected_nodes(self, heads, tc=None):
         """ heads: batch_size
         """
@@ -349,8 +366,12 @@ class Graph(object):
 
         idx_vi = selected_edges[:, 4]
         idx_vj = selected_edges[:, 5]
-        new_idx_e2vi = new_idx_e2vi[idx_vi]  # n_selected_edges x 1
-        new_idx_e2vj = new_idx_e2vj[idx_vj]  # n_selected_edges x 1
+
+        try:
+            new_idx_e2vi = new_idx_e2vi[idx_vi]  # n_selected_edges x 1
+            new_idx_e2vj = new_idx_e2vj[idx_vj]  # n_selected_edges x 1
+        except IndexError:
+            print(len(new_idx_e2vi))
 
         # selected_edges:n_selected_edges x 8, (idx, vi, vj, rel, idx_vi, idx_vj, new_idx_e2vi, new_idx_e2vj) sorted by idx, vi, vj
         selected_edges = np.concatenate([selected_edges, new_idx_e2vi, new_idx_e2vj], axis=1)

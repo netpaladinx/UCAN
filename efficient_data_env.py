@@ -142,8 +142,9 @@ class Graph(object):
         max_nodes = min(n_nodes, max_nodes)
         sorted_idx = np.argsort(-node_attention, axis=1)[:, :max_nodes]
         sorted_idx = np.array(sorted_idx, dtype='int32')
-        node_attention = np.take_along_axis(node_attention, sorted_idx, axis=1)
+        node_attention = np.take_along_axis(node_attention, sorted_idx, axis=1)  # sorted node attention
         mask = (node_attention > eps)[:, :max_nodes]
+        mask[:, 0] = True  # top-1 guaranteed
         eg_idx = np.repeat(np.expand_dims(np.array(np.arange(batch_size), dtype='int32'), 1), max_nodes, axis=1)
         eg_idx = eg_idx[mask]
         vi = sorted_idx[mask]

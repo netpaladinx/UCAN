@@ -7,8 +7,8 @@ import numpy as np
 import tensorflow as tf
 from tensorflow.python.keras.api._v2 import keras
 
-from efficient_model_2 import Model
-from efficient_data_env_2 import DataEnv
+from efficient_model_3 import Model
+from efficient_data_env_3 import DataEnv
 import datasets
 
 parser = argparse.ArgumentParser()
@@ -23,11 +23,13 @@ parser.add_argument('--max_backtrace_edges', type=int, default=200)
 parser.add_argument('--backtrace_decay', type=float, default=0.9)
 parser.add_argument('--max_epochs', type=int, default=10)
 parser.add_argument('--n_virtual_nodes', type=int, default=10)
-parser.add_argument('--init_uncon_steps', type=int, default=5)
+parser.add_argument('--init_uncon_steps_per_graph', type=int, default=10)
+parser.add_argument('--init_uncon_steps_per_batch', type=int, default=2)
+parser.add_argument('--simultaneous_uncon_flow', action='store_true', default=False)
 parser.add_argument('--max_steps', type=int, default=5)
 parser.add_argument('--learning_rate', type=float, default=0.01)
 parser.add_argument('--dataset', default='FB237')
-parser.add_argument('--timer', action='store_false')
+parser.add_argument('--timer', action='store_false', default=True)
 default_hparams = parser.parse_args()
 
 
@@ -44,12 +46,11 @@ class Trainer(object):
     def train_step(self, heads, rels, tails, time_cost=None):
         with tf.GradientTape() as tape:
             hidden_uncon, hidden_con, node_attention = \
-                self.model.initialize(heads, rels, init_uncon_steps=self.hparams.init_uncon_steps,
-                                      time_cost=time_cost)
+                self.model.init_per_batch(heads, rels, time_cost=time_cost)
             for step in range(1, self.hparams.max_steps + 1):
                 hidden_uncon, hidden_con, node_attention = \
-                    self.model.flow(hidden_uncon, hidden_con, node_attention, step, stop_uncon_steps=False,
-                                    time_cost=time_cost)
+                    self.model.flow(hidden_uncon, hidden_con, node_attention, step, time_cost=time_cost)
+            self.model.past_hidden_uncon = hidden_uncon
 
             predictions = node_attention
             pred_loss = self.loss_fn(predictions, tails)
@@ -101,7 +102,7 @@ class Evaluator(object):
 
     def eval_step(self, heads, rels, tails):
         hidden_uncon, hidden_con, node_attention = \
-            self.model.initialize(heads, rels, init_uncon_steps=self.hparams.init_uncon_steps)
+            self.model.init_per_batch(heads, rels, init_uncon_steps=self.hparams.init_uncon_steps)
         for step in range(1, self.hparams.max_steps + 1):
             hidden_uncon, hidden_con, node_attention = \
                 self.model.flow(hidden_uncon, hidden_con, node_attention, step, stop_uncon_steps=False)
@@ -193,13 +194,16 @@ def run(dataset, hparams):
         graph_i = 1
         for train_batcher, graph in data_env.draw_train(n_train):
 
+            model.init_per_graph()
+
             batch_i = 1
             for train_batch, batch_size in train_batcher(hparams.batch_size):
                 t0 = time.time()
                 time_cost = reset_time_cost(hparams)
 
                 heads, rels, tails = train_batch[:, 0], train_batch[:, 1], train_batch[:, 2]
-                cur_train_loss, cur_pred_loss, cur_accuracy = trainer.train_step(heads, rels, tails, time_cost=time_cost)
+                cur_train_loss, cur_pred_loss, cur_accuracy = trainer.train_step(heads, rels, tails,
+                                                                                 time_cost=time_cost)
 
                 train_loss, pred_loss, accuracy = trainer.metric_result()
                 dt = time.time() - t0
