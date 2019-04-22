@@ -712,6 +712,7 @@ class Model(object):
                                                        tc=time_cost['graph'] if time_cost else None)  # n_attended_nodes x 2
         attended_edges = self.graph.get_attended_edges(attended_nodes,
                                                        tc=time_cost['graph'] if time_cost else None)  # n_attended_edges x 2
+
         # sampled_edges: n_attended_edges x 2, (eg_idx, edge_id)
         # edges_y: n_attended_edges
         loglog_u, y_indices, sampled_edges = self.graph.sample_edges(attended_edges, self.sampler.edges_logits,
@@ -755,9 +756,6 @@ class Model(object):
                                                             edges_y=edges_y, hidden_con=hidden_con,
                                                             hidden_uncon=hidden_uncon,
                                                             tc=time_cost['model'] if time_cost else None)  # n_selected_edges, batch_size x n_nodes
-        ta = trans_attention.numpy()
-        if np.isnan(np.amin(ta)) or np.isnan(np.amax(ta)):
-            print(ta)
 
         ''' run consciousness flow '''
         new_hidden_con = self.con_flow(hidden_con, selected_edges=aug_selected_edges, edges_y=edges_y,

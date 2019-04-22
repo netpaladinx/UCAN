@@ -6,7 +6,7 @@ import numpy as np
 import tensorflow as tf
 from tensorflow.python.keras.api._v2 import keras
 
-from utils import get
+from utils import get, get_segment_ids
 
 class F(keras.layers.Layer):
     def __init__(self, interact, n_dims, use_bias=True, activation=None, output_weight=False, output_bias=False, name=None):
@@ -247,7 +247,7 @@ class Sampler(keras.Model):
 
     def _initialize(self, graph):
         logits_init = np.zeros((graph.n_full_edges,), np.float32)
-        for e_id, vi, rel, vj in graph.full_edges:
+        for e_id, vi, vj, rel in graph.full_edges:
             logits_init[e_id] = np.log((1. / graph.count(vi)) *
                                        (1. / graph.count((vi, rel))) *
                                        (1. / graph.count((vi, rel, vj))))
@@ -255,9 +255,9 @@ class Sampler(keras.Model):
 
     def call(self, _, candidate_edges=None, loglog_u=None, sampled_edges=None, mode=None, training=None, tc=None):
         """ inputs: None
-            candidate_edges: (pd.DataFram) n_candidate_edges x 5, (eg_idx, edge_id, vi, vj, rel) sorted by (eg_idx, edge_id)
+            candidate_edges: (np.array) n_candidate_edges x 5, (eg_idx, edge_id, vi, vj, rel) sorted by (eg_idx, edge_id)
             loglog_u: (np.array) n_candidate_edges
-            sampled_edges: (pd.DataFrame) n_sampled_edges x 6, (eg_idx, edge_id, vi, vj, rel, ca_idx) sorted by (eg_idx, edge_id)
+            sampled_edges: (np.array) n_sampled_edges x 6, (eg_idx, edge_id, vi, vj, rel, ca_idx) sorted by (eg_idx, edge_id)
         """
         assert candidate_edges is not None
         assert loglog_u is not None
@@ -267,19 +267,17 @@ class Sampler(keras.Model):
             t0 = time.time()
 
         if mode == 'by_eg':
-            segment_ids = candidate_edges['eg_idx'].values  # n_candidate_edges
+            segment_ids = candidate_edges[:, 0]  # n_candidate_edges
 
         elif mode == 'by_vi':
-            idx_and_vi = candidate_edges[['eg_idx', 'vi']].values
-            _, segment_ids = np.unique(idx_and_vi, axis=0, return_inverse=True)
-            segment_ids = np.array(segment_ids, dtype='int32')  # n_candidate_edges
+            segment_ids = get_segment_ids(candidate_edges[:, [0, 2]])
 
         else:
             raise ValueError('Invalid `mode`')
 
-        edge_id = candidate_edges['edge_id'].values
+        edge_id = candidate_edges[:, 1]
         logits = tf.gather(self.edges_logits, edge_id)  # n_candidate_edges
-        ca_idx = sampled_edges['ca_idx'].values  # n_sampled_edges
+        ca_idx = sampled_edges[:, 5]  # n_sampled_edges
 
         edges_y = self._gumbel_softmax(logits, loglog_u, segment_ids, ca_idx)
 
@@ -635,14 +633,14 @@ class Model(object):
         # run unconsciousness flow initially for multiple steps
         if self.hparams.init_uncon_steps_per_graph is not None:
             for _ in range(self.hparams.init_uncon_steps_per_graph):
-                # candidate_edges: (pd.DataFrame) n_candidate_edges x 5, (eg_idx, edge_id, vi, vj, rel) sorted by (eg_idx, edge_id)
+                # candidate_edges: (np.array) n_candidate_edges x 5, (eg_idx, edge_id, vi, vj, rel) sorted by (eg_idx, edge_id)
                 candidate_edges = self.graph.get_candidate_edges()
 
                 # edges_logits: (tf.Variable) n_full_edges
                 edges_logits = self.sampler.edges_logits
 
                 # loglog_u: (np.array) n_candidate_edges
-                # sampled_edges: (pd.DataFrame) n_sampled_edges x 6, (eg_idx, edge_id, vi, vj, rel, ca_idx) sorted by (eg_idx, edge_id)
+                # sampled_edges: (np.array) n_sampled_edges x 6, (eg_idx, edge_id, vi, vj, rel, ca_idx) sorted by (eg_idx, edge_id)
                 loglog_u, sampled_edges = self.graph.sample_edges(candidate_edges, edges_logits,
                                                                   mode='by_eg',
                                                                   max_edges_per_eg=self.hparams.max_edges_per_example)
@@ -667,11 +665,11 @@ class Model(object):
         ''' run unconsciousness flow initially for multiple steps '''
         if self.hparams.init_uncon_steps_per_batch is not None:
             for _ in range(self.hparams.init_uncon_steps_per_batch):
-                # candidate_edges: (pd.DataFrame) n_candidate_edges x 5, (eg_idx, edge_id, vi, vj, rel) sorted by (eg_idx, edge_id)
+                # candidate_edges: (np.array) n_candidate_edges x 5, (eg_idx, edge_id, vi, vj, rel) sorted by (eg_idx, edge_id)
                 candidate_edges = self.graph.get_candidate_edges(tc=get(tc, 'graph'))
 
                 # loglog_u: (np.array) n_candidate_edges
-                # sampled_edges: (pd.DataFrame) n_sampled_edges x 6, (eg_idx, edge_id, vi, vj, rel, ca_idx) sorted by (eg_idx, edge_id)
+                # sampled_edges: (np.array) n_sampled_edges x 6, (eg_idx, edge_id, vi, vj, rel, ca_idx) sorted by (eg_idx, edge_id)
                 loglog_u, sampled_edges = self.graph.sample_edges(candidate_edges, self.sampler.edges_logits,
                                                                   mode='by_eg',
                                                                   max_edges_per_eg=self.hparams.max_edges_per_example,
@@ -713,11 +711,11 @@ class Model(object):
         """
         ''' run unconsciousness flow '''
         if self.hparams.simultaneous_uncon_flow:
-            # candidate_edges: (pd.DataFrame) n_candidate_edges x 5, (eg_idx, edge_id, vi, vj, rel) sorted by (eg_idx, edge_id)
+            # candidate_edges: (np.array) n_candidate_edges x 5, (eg_idx, edge_id, vi, vj, rel) sorted by (eg_idx, edge_id)
             candidate_edges = self.graph.get_candidate_edges(get(tc, 'graph'))
 
             # loglog_u: (np.array) n_candidate_edges
-            # sampled_edges: (pd.DataFrame) n_sampled_edges x 6, (eg_idx, edge_id, vi, vj, rel, ca_idx) sorted by (eg_idx, edge_id)
+            # sampled_edges: (np.array) n_sampled_edges x 6, (eg_idx, edge_id, vi, vj, rel, ca_idx) sorted by (eg_idx, edge_id)
             loglog_u, sampled_edges = self.graph.sample_edges(candidate_edges, self.sampler.edges_logits,
                                                               mode='by_eg',
                                                               max_edges_per_eg=self.hparams.max_edges_per_example,
@@ -740,12 +738,12 @@ class Model(object):
         attended_nodes = self.graph.get_topk_nodes(node_attention, self.hparams.max_attended_nodes,
                                                    tc=get(tc, 'graph'))  # n_attended_nodes x 2
 
-        # candidate_edges: (pd.DataFrame) n_candidate_edges x 5, (eg_idx, edge_id, vi, vj, rel) sorted by (eg_idx, edge_id)
+        # candidate_edges: (np.array) n_candidate_edges x 5, (eg_idx, edge_id, vi, vj, rel) sorted by (eg_idx, edge_id)
         candidate_edges = self.graph.get_candidate_edges(attended_nodes=attended_nodes,
                                                          tc=get(tc, 'graph'))  # n_candidate_edges x 2
 
         # loglog_u: (np.array) n_candidate_edges
-        # sampled_edges: (pd.DataFrame) n_sampled_edges x 6, (eg_idx, edge_id, vi, vj, rel, ca_idx) sorted by (eg_idx, edge_id)
+        # sampled_edges: (np.array) n_sampled_edges x 6, (eg_idx, edge_id, vi, vj, rel, ca_idx) sorted by (eg_idx, edge_id)
         loglog_u, sampled_edges = self.graph.sample_edges(candidate_edges, self.sampler.edges_logits,
                                                           mode='by_vi',
                                                           max_edges_per_vi=self.hparams.max_edges_per_node,
@@ -793,7 +791,7 @@ class Model(object):
         self.node_attention_trace.append(new_node_attention)
 
         ''' get seen edges '''
-        # seen_nodes: (np.array) n_seen_nodes x 2, (eg_idx, vj) unique but not sorted
+        # seen_nodes: (np.array) n_seen_nodes x 2, (eg_idx, vj) unique and sorted
         seen_nodes = self.graph.get_topk_nodes(new_node_attention, self.hparams.max_seen_nodes,
                                                tc=get(tc, 'graph'))  # n_seen_nodes x 2
 
