@@ -1,3 +1,4 @@
+import itertools
 import numpy as np
 import pandas as pd
 import tensorflow as tf
@@ -51,9 +52,9 @@ def groupby_1cols_nlargest(x, y, k):
 
 
 def groupby_1cols_merge(x, x_key, y_key, y_id):
-    """ x: (np.array) d0, sorted
-        x_key: (np.array): d0, unique in group
-        y_key: (np.array): d1
+    """ x (group by): (np.array) d0, sorted
+        x_key (merge left key): (np.array): d0, unique in group
+        y_key (merge right key): (np.array): d1
         y_id: (np.array): d1
     """
     mask = (x[1:] != x[:-1])
@@ -65,3 +66,24 @@ def groupby_1cols_merge(x, x_key, y_key, y_id):
     grp_idx = np.concatenate([np.repeat(np.array([i], dtype='int32'), len(yid)) for i, yid in enumerate(yid_li)])
     return res_idx, grp_idx
 
+
+def groupby_1cols_cartesian(x, v1, y, v2):
+    """ x: d0, sorted
+        v1: d0
+        y: d1, sorted
+        v2: d1
+    """
+    mask = (x[1:] != x[:-1])
+    n = len(x)
+    x_key_idx = np.concatenate([np.array([0]), np.arange(1, n)[mask], np.array([n])])
+    mask = (y[1:] != y[:-1])
+    n = len(y)
+    y_key_idx = np.concatenate([np.array([0]), np.arange(1, n)[mask], np.array([n])])
+    batch_size = len(x_key_idx) - 1
+    return np.array([(eg_idx, vi, vj)
+                     for eg_idx, s1, e1, s2, e2 in zip(np.arange(batch_size),
+                                                       x_key_idx[:-1],
+                                                       x_key_idx[1:],
+                                                       y_key_idx[:-1],
+                                                       y_key_idx[1:])
+                     for vi, vj in itertools.product(v1[s1:e1], v2[s2:e2])], dtype='int32')

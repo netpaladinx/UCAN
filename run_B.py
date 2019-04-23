@@ -12,7 +12,8 @@ import pandas as pd
 import tensorflow as tf
 from tensorflow.python.keras.api._v2 import keras
 
-from utils import get, get_segment_ids, get_unique, groupby_2cols_nlargest, groupby_1cols_nlargest, groupby_1cols_merge
+from utils import get, get_segment_ids, get_unique, groupby_2cols_nlargest, groupby_1cols_nlargest, \
+    groupby_1cols_merge, groupby_1cols_cartesian
 import datasets
 
 """ dataenv.py """
@@ -62,9 +63,8 @@ class Graph(object):
         self.edges = None
         self.n_edges = 0
 
-        self.past_transitions = None  # (pd.DataFrame) (eg_idx, vi, vj, rel, step, trans_att) (not sorted)
-
         self.memorized_nodes = None  # (np.array) (eg_idx, v) sorted by ed_idx, v
+        self.memorized_node_atts = None  # (np.array) (v_att,) listed according to `memorized_nodes`
 
         self.node_attention_li = None
         self.attend_nodes_li = None
@@ -250,6 +250,7 @@ class Graph(object):
         batch_size = heads.shape[0]
         eg_idx = np.array(np.arange(batch_size), dtype='int32')
         self.memorized_nodes = np.stack([eg_idx, heads], axis=1)
+        self.memorized_node_atts = np.ones((batch_size,))
 
         if tc is not None:
             tc['i_memo_v'] += time.time() - t0
@@ -278,20 +279,14 @@ class Graph(object):
         # topk_nodes: (np.array) n_topk_nodes x 2, (eg_idx, vi) sorted
         return topk_nodes
 
-    def set_past_transitions(self):
-        self.past_transitions = None  # (pd.DataFrame) (eg_idx, vi, vj, rel, step, trans_att) (not sorted)
-
     def set_node_attention_li(self, node_attention):
         self.node_attention_li = [node_attention.numpy()]
 
     def set_attended_nodes_li(self):
         self.attend_nodes_li = []
 
-    def get_selfloop_and_backtrace(self, attended_nodes, attended_node_att, max_backtrace_edges, step,
-                                   backtrace_decay=1., tc=None):
-        """ attended_nodes: (np.array) n_attended_nodes x 2, (eg_idx, vi) not sorted
-            attended_node_att: (tf.Tensor) n_attended_nodes
-            step: the current step
+    def get_selfloop_and_backtrace(self, attended_nodes, max_backtrace_nodes, tc=None):
+        """ attended_nodes: (np.array) n_attended_nodes x 2, (eg_idx, vi) sorted
         """
         if tc is not None:
             t0 = time.time()
@@ -300,22 +295,17 @@ class Graph(object):
         selfloop_edges = np.stack([eg_idx, vi, vi, np.repeat(np.array(self.selfloop, dtype='int32'), eg_idx.shape[0])],
                                   axis=1)  # (eg_idx, vi, vi, selfloop)
 
-        if self.past_transitions is None:
+        if self.memorized_nodes is None:
             return selfloop_edges, None
 
-        attended_node_att = attended_node_att.numpy()  # n_attended_nodes
-        attended_pd = pd.DataFrame({'eg_idx': attended_nodes[:, 0],
-                                    'vj': attended_nodes[:, 1],
-                                    'vj_att': attended_node_att})
-        merged_pd = pd.merge(self.past_transitions, attended_pd, on=['eg_idx', 'vj'])
-        # merged_pd: (eg_idx, vi, vj, rel, step, trans_att, vj_att, att)
-        merged_pd['att'] = merged_pd['trans_att'] * merged_pd['vj_att'] * (backtrace_decay ** (step - merged_pd['step']))
-        result_pd = merged_pd.sort_values(['att']).groupby(['eg_idx']).head(max_backtrace_edges)
-        result = result_pd[['eg_idx', 'vj', 'vi']].sort_values(['eg_idx', 'vj', 'vi']).values
-        # result: (eg_idx, vj, vi, backtrace)
-        backtrace_edges = np.concatenate([result,
+        backtrace_idx = groupby_1cols_nlargest(self.memorized_nodes[:, 0], self.memorized_node_atts, max_backtrace_nodes)
+        backtrace_nodes = self.memorized_nodes[backtrace_idx]  # (eg_idx, vj)
+        backtrace_edges = groupby_1cols_cartesian(attended_nodes[:, 0], attended_nodes[:, 1],
+                                                  backtrace_nodes[:, 0], backtrace_nodes[:, 1])
+        # backtrace_edges: (eg_idx, vj, vi, backtrace)
+        backtrace_edges = np.concatenate([backtrace_edges,
                                           np.expand_dims(np.repeat(np.array(self.backtrace, dtype='int32'),
-                                                                   len(result)), 1)], axis=1)
+                                                                   len(backtrace_edges)), 1)], axis=1)
 
         if tc is not None:
             tc['sl_bt'] += time.time() - t0
@@ -354,40 +344,13 @@ class Graph(object):
         # aug_scanned_edges: n_aug_scanned_edges x 6, (eg_idx, vi, vj, rel, idx_vi, idx_vj) sorted by (eg_idx, vi, vj)
         return aug_scanned_edges, new_idx_for_edges_y, rest_idx
 
-    def add_transitions(self, seen_edges, trans_att, step, tc=None):
-        """ seen_edges: n_seen_edges x 6 (eg_idx, vi, vj, rel, idx_vi, idx_vj, new_idx_e2vi, new_idx_e2vj) sorted by (eg_idx, vi, vj)
-            trans_att: (numpy) n_seen_edges
-        """
-        if tc is not None:
-            t0 = time.time()
-
-        trans_att = trans_att.numpy()
-        mask = (seen_edges[:, 3] != self.selfloop) * (seen_edges[:, 3] != self.backtrace)
-        seen_edges = seen_edges[mask]
-        trans_att = trans_att[mask]
-
-        transitions = pd.DataFrame({'eg_idx': seen_edges[:, 0],
-                                    'vi': seen_edges[:, 1],
-                                    'vj': seen_edges[:, 2],
-                                    'rel': seen_edges[:, 3],
-                                    'step': np.repeat(np.array(step, dtype='int32'), len(seen_edges)),
-                                    'trans_att': trans_att})
-
-        if self.past_transitions is None:
-            self.past_transitions = transitions
-        else:
-            self.past_transitions = pd.concat([self.past_transitions, transitions], ignore_index=True, sort=False)
-
-        if tc is not None:
-            tc['add_trans'] += time.time() - t0
-
     def add_node_attention(self, node_attention):
         self.node_attention_li.append(node_attention.numpy())
 
     def add_attended_nodes(self, attended_nodes):
         self.attend_nodes_li.append(attended_nodes)
 
-    def add_nodes_to_memorized(self, selected_edges, inplace=False, tc=None):
+    def add_nodes_to_memorized(self, selected_edges, node_attention=None, backtrace_decay=1., inplace=False, tc=None):
         """ selected_edges: (np.array) n_selected_edges x 6, (eg_idx, vi, vj, rel, idx_vi, idx_vj) sorted by (eg_idx, vi, vj)
         """
         if tc is not None:
@@ -411,7 +374,11 @@ class Graph(object):
             new_idx_for_memorized = np.expand_dims(new_idx[:n_memorized_nodes], 1)
 
             if inplace:
+                assert node_attention is not None
                 self.memorized_nodes = memorized_and_new
+                cur_attts = tf.gather_nd(node_attention, memorized_and_new).numpy()
+                prev_atts = tf.scatter_nd(new_idx_for_memorized, self.memorized_node_atts, (n_memorized_and_new_nodes,)).numpy()
+                self.memorized_node_atts = cur_attts + prev_atts * backtrace_decay
         else:
             new_idx_for_memorized = None
             memorized_and_new = self.memorized_nodes
@@ -886,7 +853,7 @@ class UnconsciousnessFlow(keras.Model):
         update = self.f_hidden((message_aggr, hidden, ent_emb))  # 1 x n_nodes x n_dims_lg
         update = self.g_hidden(update)  # 1 x n_nodes x n_dims_lg
         hidden = self.gru((hidden, update))  # 1 x n_nodes x n_dims_lg
-        self.hidden = hidden
+        #self.hidden = hidden
 
         if tc is not None:
             tc['u.call'] += time.time() - t0
@@ -1181,7 +1148,6 @@ class Model(object):
 
         self.node_attention_trace = [node_attention]
 
-        self.graph.set_past_transitions()
         self.graph.set_node_attention_li(node_attention)
         self.graph.set_attended_nodes_li()
 
@@ -1220,7 +1186,7 @@ class Model(object):
             new_hidden_uncon = hidden_uncon  # 1 x n_nodes x n_dims_lg
 
         ''' get scanned edges '''
-        # attended_nodes: (np.array) n_attended_nodes x 2, (eg_idx, vi) not sorted
+        # attended_nodes: (np.array) n_attended_nodes x 2, (eg_idx, vi) sorted
         attended_nodes = self.graph.get_topk_nodes(node_attention, self.hparams.max_attended_nodes,
                                                    tc=get(tc, 'graph'))  # n_attended_nodes x 2
 
@@ -1243,12 +1209,8 @@ class Model(object):
         scanned_edges = self.graph.get_selected_edges(sampled_edges, tc=get(tc, 'graph'))
 
         ''' add selfloop and backtrace edges '''
-        attended_node_att = tf.gather_nd(node_attention, attended_nodes)  # n_attended_nodes
         selfloop_edges, backtrace_edges = self.graph.get_selfloop_and_backtrace(attended_nodes,
-                                                                                attended_node_att,
-                                                                                self.hparams.max_backtrace_edges,
-                                                                                step,
-                                                                                backtrace_decay=self.hparams.backtrace_decay,
+                                                                                self.hparams.max_backtrace_nodes,
                                                                                 tc=get(tc, 'graph'))
 
         # aug_scanned_edges: n_aug_scanned_edges x 6, (eg_idx, vi, vj, rel, idx_vi, idx_vj) sorted by (eg_idx, vi, vj)
@@ -1292,7 +1254,9 @@ class Model(object):
         # new_idx_for_memorized: n_memorized_nodes x 1 or None
         # memorized_and_seen: _memorized_and_seen_nodes x 2, (eg_idx, v) sorted by (eg_idx, v)
         new_idx_for_memorized, n_memorized_and_seen_nodes, memorized_and_seen = \
-            self.graph.add_nodes_to_memorized(seen_edges, inplace=True, tc=get(tc, 'graph'))
+            self.graph.add_nodes_to_memorized(seen_edges, node_attention=new_node_attention,
+                                              backtrace_decay=self.hparams.backtrace_decay,
+                                              inplace=True, tc=get(tc, 'graph'))
 
         if new_idx_for_memorized is not None:
             hidden_con = tf.scatter_nd(new_idx_for_memorized, hidden_con,
@@ -1307,7 +1271,6 @@ class Model(object):
                                        tc=get(tc, 'model'))  # n_memorized_nodes (new) x n_dims
 
         ''' do storing work at the end of each step '''
-        self.graph.add_transitions(seen_edges, trans_attention, step)
         self.graph.add_node_attention(new_node_attention)
         self.graph.add_attended_nodes(attended_nodes)
 
@@ -1364,25 +1327,25 @@ parser.add_argument('--print_train', action='store_true', default=True)
 
 
 # Countries
-parser.add_argument('-bs', '--batch_size', type=int, default=100)
+parser.add_argument('-bs', '--batch_size', type=int, default=8)
 parser.add_argument('--n_dims_sm', type=int, default=10)
-parser.add_argument('--n_dims', type=int, default=20)
-parser.add_argument('--n_dims_lg', type=int, default=20)
-parser.add_argument('--ent_emb_l2', type=float, default=0.01)
-parser.add_argument('--rel_emb_l2', type=float, default=0.01)
+parser.add_argument('--n_dims', type=int, default=50)
+parser.add_argument('--n_dims_lg', type=int, default=50)
+parser.add_argument('--ent_emb_l2', type=float, default=0.1)
+parser.add_argument('--rel_emb_l2', type=float, default=0.1)
 parser.add_argument('--max_edges_per_example', type=int, default=1000)
-parser.add_argument('--max_attended_nodes', type=int, default=2)
-parser.add_argument('--max_edges_per_node', type=int, default=50)
-parser.add_argument('--max_backtrace_edges', type=int, default=50)
+parser.add_argument('--max_attended_nodes', type=int, default=1)
+parser.add_argument('--max_edges_per_node', type=int, default=2)
+parser.add_argument('--max_backtrace_nodes', type=int, default=5)
 parser.add_argument('--backtrace_decay', type=float, default=0.9)
-parser.add_argument('--max_seen_nodes', type=int, default=10)
+parser.add_argument('--max_seen_nodes', type=int, default=20)
 parser.add_argument('--max_epochs', type=int, default=10)
 parser.add_argument('--n_clustering', type=int, default=0)
 parser.add_argument('--n_clusters_per_clustering', type=int, default=0)
 parser.add_argument('--connected_clustering', action='store_true', default=True)
-parser.add_argument('--init_uncon_steps_per_batch', type=int, default=5)
-parser.add_argument('--simultaneous_uncon_flow', action='store_true', default=False)
-parser.add_argument('--max_steps', type=int, default=10)
+parser.add_argument('--init_uncon_steps_per_batch', type=int, default=0)
+parser.add_argument('--simultaneous_uncon_flow', action='store_true', default=True)
+parser.add_argument('--max_steps', type=int, default=20)
 #parser.add_argument('--step_weights', default='0.05,0.05,0.05,0.05,0.8')
 parser.add_argument('--learning_rate', type=float, default=0.01)
 parser.add_argument('--dataset', default='Countries')
@@ -1599,7 +1562,7 @@ def run(dataset, hparams):
                 train_loss, pred_loss, accuracy = trainer.metric_result()
                 dt = time.time() - t0
 
-                if hparams.print_train and batch_i % 10 == 1:
+                if hparams.print_train and graph_i % 10 == 1 and batch_i % 10 == 1:
                     print('{:d}, {:d}, {:d} | tr_ls: {:.4f} ({:.4f}) | pr_ls: {:.4f} ({:.4f}) | acc: {:.4f} ({:.4f}) |'
                           ' t: {:3f} | {}'.format(epoch, graph_i, batch_i,
                                                   train_loss.numpy(), cur_train_loss,
