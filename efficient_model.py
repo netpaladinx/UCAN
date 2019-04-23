@@ -1,3 +1,6 @@
+from collections import defaultdict
+import time
+
 import numpy as np
 
 import tensorflow as tf
@@ -70,31 +73,59 @@ class G(keras.layers.Layer):
         return outputs
 
 
-class N2E(keras.layers.Layer):
-    def call(self, inputs, selected_edges=None, training=None):
+class Node2Edge(keras.layers.Layer):
+    def call(self, inputs, selected_edges=None, return_vi=True, return_vj=True, training=None):
         """ inputs (hidden): batch_size x n_nodes x n_dims
-            selected_edges: n_selected_edges x 6 ( int32, selected_edges[i] = (idx, vi, vj, rel, idx_vi, idx_vj), sorted by idx, vi, vj )
+            selected_edges: n_selected_edges x 6 (or 8) ( int32, selected_edges[i] = (idx, vi, vj, rel, idx_vi, idx_vj), sorted by idx, vi, vj )
         """
         assert selected_edges is not None
         hidden = inputs
-        idx_and_vi = tf.stack([selected_edges[:, 0], selected_edges[:, 1]], axis=1)  # n_selected_edges x 2
-        idx_and_vj = tf.stack([selected_edges[:, 0], selected_edges[:, 2]], axis=1)  # n_selected_edges x 2
-        hidden_vi = tf.gather_nd(hidden, idx_and_vi)  # n_selected_edges x n_dims
-        hidden_vj = tf.gather_nd(hidden, idx_and_vj)  # n_selected_edges x n_dims
-        return hidden_vi, hidden_vj
+        batch_size = tf.shape(inputs)[0]
+        n_selected_edges = len(selected_edges)
+        idx = tf.cond(tf.equal(batch_size, 1), lambda: tf.zeros((n_selected_edges,), dtype='int32'), lambda: selected_edges[:, 0])
+        result = []
+        if return_vi:
+            idx_and_vi = tf.stack([idx, selected_edges[:, 1]], axis=1)  # n_selected_edges x 2
+            hidden_vi = tf.gather_nd(hidden, idx_and_vi)  # n_selected_edges x n_dims
+            result.append(hidden_vi)
+        if return_vj:
+            idx_and_vj = tf.stack([idx, selected_edges[:, 2]], axis=1)  # n_selected_edges x 2
+            hidden_vj = tf.gather_nd(hidden, idx_and_vj)  # n_selected_edges x n_dims
+            result.append(hidden_vj)
+        return result
+
+
+class Node2Edge_v2(keras.layers.Layer):
+    def call(self, inputs, selected_edges=None, return_vi=True, return_vj=True, training=None):
+        """ inputs (hidden): n_selected_nodes x n_dims
+            selected_edges: n_selected_edges x 8 ( int32, selected_edges[i] = (idx, vi, vj, rel, idx_vi, idx_vj, new_idx_e2vi, new_idx_e2vj), sorted by idx, vi, vj )
+        """
+        assert selected_edges is not None
+        assert return_vi or return_vj
+        hidden = inputs
+        result = []
+        if return_vi:
+            new_idx_e2vi = selected_edges[:, 6]  # n_selected_edges
+            hidden_vi = tf.gather(hidden, new_idx_e2vi)  # n_selected_edges x n_dims
+            result.append(hidden_vi)
+        if return_vj:
+            new_idx_e2vj = selected_edges[:, 7]  # n_selected_edges
+            hidden_vj = tf.gather(hidden, new_idx_e2vj)  # n_selected_edges x n_dims
+            result.append(hidden_vj)
+        return result
 
 
 class Aggregate(keras.layers.Layer):
     def call(self, inputs, selected_edges=None, output_shape=None, at='vj', aggr_op='mean', training=None):
         """ inputs (edge_vec): n_seleted_edges x ...
             selected_edges: n_selected_edges x 6 ( int32, selected_edges[i] = (idx, vi, vj, rel, idx_vi, idx_vj), sorted by idx, vi, vj )
-            output_shape: (batch_size, n_nodes, ...)
+            output_shape: (batch_size=1, n_nodes, ...)
         """
         assert selected_edges is not None
         assert output_shape is not None
         edge_vec = inputs
         if at == 'vi':
-            idx_vi = selected_edges[:, -2]  # n_selected_edges
+            idx_vi = selected_edges[:, 4]  # n_selected_edges
             aggr_op = tf.math.segment_mean if aggr_op == 'mean' else \
                 tf.math.segment_sum if aggr_op == 'sum' else \
                 tf.math.segment_max if aggr_op == 'max' else None
@@ -103,7 +134,7 @@ class Aggregate(keras.layers.Layer):
             idx_and_vi = tf.cast(tf.math.segment_max(idx_and_vi, idx_vi), tf.int32)  # (max_id_vi+1) x 2
             edge_vec_aggr = tf.scatter_nd(idx_and_vi, edge_vec_aggr, output_shape)  # batch_size x n_nodes x ...
         elif at == 'vj':
-            idx_vj = selected_edges[:, -1]  # n_selected_edges
+            idx_vj = selected_edges[:, 5]  # n_selected_edges
             max_idx_vj = tf.reduce_max(idx_vj)
             aggr_op = tf.math.unsorted_segment_mean if aggr_op == 'mean' else \
                 tf.math.unsorted_segment_sum if aggr_op == 'sum' else \
@@ -117,15 +148,50 @@ class Aggregate(keras.layers.Layer):
         return edge_vec_aggr
 
 
-class Normalize(keras.layers.Layer):
+class Aggregate_v2(keras.layers.Layer):
+    def call(self, inputs, selected_edges=None, output_shape=None, at='vj', aggr_op='mean', training=None):
+        """ inputs (edge_vec): n_seleted_edges x ...
+            selected_edges: n_selected_edges x 8 ( int32, selected_edges[i] = (idx, vi, vj, rel, idx_vi, idx_vj, new_idx_e2vi, new_idx_e2vj), sorted by idx, vi, vj )
+            output_shape: (n_visited_nodes, ...)
+        """
+        assert selected_edges is not None
+        assert output_shape is not None
+        edge_vec = inputs
+        if at == 'vi':
+            idx_vi = selected_edges[:, 4]  # n_selected_edges
+            aggr_op = tf.math.segment_mean if aggr_op == 'mean' else \
+                tf.math.segment_sum if aggr_op == 'sum' else \
+                tf.math.segment_max if aggr_op == 'max' else None
+            edge_vec_aggr = aggr_op(edge_vec, idx_vi)  # (max_idx_vi+1) x ...
+            new_idx_e2vi = selected_edges[:, 6]  # n_selected_edges
+            reduced_idx_e2vi = tf.cast(tf.math.segment_max(new_idx_e2vi, idx_vi), tf.int32)  # (max_id_vi+1)
+            reduced_idx_e2vi = tf.expand_dims(reduced_idx_e2vi, 1)  # (max_id_vi+1) x 1
+            edge_vec_aggr = tf.scatter_nd(reduced_idx_e2vi, edge_vec_aggr, output_shape)  # n_visited_nodes x ...
+        elif at == 'vj':
+            idx_vj = selected_edges[:, 5]  # n_selected_edges
+            max_idx_vj = tf.reduce_max(idx_vj)
+            aggr_op = tf.math.unsorted_segment_mean if aggr_op == 'mean' else \
+                tf.math.unsorted_segment_sum if aggr_op == 'sum' else \
+                tf.math.unsorted_segment_max if aggr_op == 'max' else None
+            edge_vec_aggr = aggr_op(edge_vec, idx_vj, max_idx_vj + 1)  # (max_idx_vj+1) x ...
+            new_idx_e2vj = selected_edges[:, 7]  # n_selected_edges
+            reduced_idx_e2vj = tf.cast(tf.math.unsorted_segment_max(new_idx_e2vj, idx_vj, max_idx_vj + 1), tf.int32)  # (max_idx_vj+1)
+            reduced_idx_e2vj = tf.expand_dims(reduced_idx_e2vj, 1)  # (max_idx_vj+1) x 1
+            edge_vec_aggr = tf.scatter_nd(reduced_idx_e2vj, edge_vec_aggr, output_shape)  # n_visited_nodes x ...
+        else:
+            raise ValueError('Invalid `at`')
+        return edge_vec_aggr
+
+
+class NeighborSoftmax(keras.layers.Layer):
     def call(self, inputs, selected_edges=None, at='vi', training=None):
         """ inputs (edge_vec): n_seleted_edges x ...
-            selected_edges: n_selected_edges x 6 ( int32, selected_edges[i] = (idx, vi, vj, rel, idx_vi, idx_vj), sorted by idx, vi, vj )
+            selected_edges: n_selected_edges x 8 ( int32, selected_edges[i] = (idx, vi, vj, rel, idx_vi, idx_vj, new_idx_e2vi, new_idx_e2vj), sorted by idx, vi, vj )
         """
         assert selected_edges is not None
         edge_vec = inputs
         if at == 'vi':
-            idx_vi = selected_edges[:, -2]  # n_selected_edges
+            idx_vi = selected_edges[:, 4]  # n_selected_edges
             edge_vec_max = tf.math.segment_max(edge_vec, idx_vi)  # (max_idx_vi+1) x ...
             edge_vec_max = tf.gather(edge_vec_max, idx_vi)  # n_selected_edges x ...
             edge_vec_exp = tf.math.exp(edge_vec - edge_vec_max)  # n_selected_edges x ...
@@ -133,7 +199,7 @@ class Normalize(keras.layers.Layer):
             edge_vec_expsum = tf.gather(edge_vec_expsum, idx_vi)  # n_selected_edges x ...
             edge_vec_norm = edge_vec_exp / edge_vec_expsum  # n_selected_edges x ...
         elif at == 'vj':
-            idx_vj = selected_edges[:, -1]  # n_selected_edges
+            idx_vj = selected_edges[:, 5]  # n_selected_edges
             max_idx_vj = tf.reduce_max(idx_vj)
             edge_vec_max = tf.math.unsorted_segment_max(edge_vec, idx_vj, max_idx_vj + 1)  # (max_idx_vi+1) x ...
             edge_vec_max = tf.gather(edge_vec_max, idx_vj)  # n_selected_edges x ...
@@ -150,7 +216,7 @@ class Sampler(keras.Model):
     def __init__(self, graph):
         super(Sampler, self).__init__(name='sampler')
         with tf.name_scope(self.name):
-            self.edges_p = self.add_weight(shape=(graph.n_full_edges,),
+            self.edges_p = self.add_weight(shape=(graph.n_full_edges,),  # n_full_edges
                                            initializer=keras.initializers.constant(self._initialize(graph)),
                                            name='edges_p')
 
@@ -160,10 +226,12 @@ class Sampler(keras.Model):
             p_init[e_id] = (1. / graph.count(vi)) * (1. / graph.count((vi, rel))) * (1. / graph.count((vi, rel, vj)))
         return p_init
 
-    def call(self, inputs, max_edges=None, training=None):
+    def call(self, inputs, max_edges=None, training=None, tc=None):
         """ inputs: n_candidate_edges x 2 ( inputs[i] = (eg_idx, edge_id) )
         """
         assert max_edges is not None
+        if tc is not None:
+            t0 = time.time()
 
         eg_idx, edge_id = tf.split(inputs, 2, axis=1)  # n_candidate_edges, n_candidate_edges
         batch_size = tf.reduce_max(eg_idx) + 1
@@ -199,6 +267,8 @@ class Sampler(keras.Model):
         outputs = outputs.gather(idx_range)
         edges_y = edges_y.gather(idx_range)
 
+        if tc is not None:
+            tc['s.call'] += time.time() - t0
         # outputs: n_sampled_edges x 2 ( int32, outputs[i] = (eg_idx, edge_id) )
         # edges_y: n_sampled_edges ( float32, edges_y[i] = y )
         return outputs, edges_y
@@ -211,6 +281,7 @@ class Sampler(keras.Model):
         y = tf.math.softmax(y / temperature)
         k = tf.math.minimum(k, tf.shape(y)[-1])
         y, ind = tf.math.top_k(y, k=k)
+
         if hard:
             y_hard = tf.ones_like(y)
             y = tf.stop_gradient(y_hard - y) + y
@@ -221,7 +292,7 @@ class Sampler(keras.Model):
 
 
 class UnconsciousnessFlow(keras.Model):
-    def __init__(self, n_entities, n_relations, n_dims, l2_factor):
+    def __init__(self, n_entities, n_relations, n_dims, ent_emb_l2, rel_emb_l2):
         """ n_entities: including virtual nodes
             n_relations: including 'virtual' but not 'selfloop' and 'backtrace'
         """
@@ -230,10 +301,10 @@ class UnconsciousnessFlow(keras.Model):
         self.n_dims = n_dims
 
         self.entity_embedding = keras.layers.Embedding(n_entities, self.n_dims,
-                                                       embeddings_regularizer=keras.regularizers.l2(l2_factor),
+                                                       embeddings_regularizer=keras.regularizers.l2(ent_emb_l2),
                                                        name='entities')
         self.relation_embedding = keras.layers.Embedding(n_relations, self.n_dims,
-                                                         embeddings_regularizer=keras.regularizers.l2(l2_factor),
+                                                         embeddings_regularizer=keras.regularizers.l2(rel_emb_l2),
                                                          name='relations')
 
         # f(message_aggr, hidden, ent_emb)
@@ -246,11 +317,11 @@ class UnconsciousnessFlow(keras.Model):
                            activation=tf.nn.relu, output_weight=True, output_bias=True, name='f_msg')
         self.g_message = G(self.n_dims, activation=tf.nn.relu, output_weight=True, output_bias=True, name='g_msg')
 
-        self.nodes_to_edges = N2E()
+        self.nodes_to_edges = Node2Edge()
 
         self.aggregate = Aggregate()
 
-    def call(self, inputs, selected_edges=None, edges_y=None, training=None):
+    def call(self, inputs, selected_edges=None, edges_y=None, training=None, tc=None):
         """ inputs (hidden): 1 x n_nodes x n_dims
             selected_edges: n_selected_edges x 6 ( int32, selected_edges[i] = (idx, vi, vj, rel, idx_vi, idx_vj), sorted by idx, vi, vj )
                 * batch_size = 1
@@ -258,6 +329,8 @@ class UnconsciousnessFlow(keras.Model):
         """
         assert selected_edges is not None
         assert edges_y is not None
+        if tc is not None:
+            t0 = time.time()
 
         ent_idx = tf.expand_dims(tf.range(0, self.n_nodes), axis=0)  # 1 x n_nodes
         ent_emb = self.entity_embedding(ent_idx)  # 1 x n_nodes x n_dims
@@ -279,9 +352,15 @@ class UnconsciousnessFlow(keras.Model):
         update = self.f_hidden((message_aggr, hidden, ent_emb))  # 1 x n_nodes x n_dims
         update = self.g_hidden(update)
         hidden = hidden + update
+
+        if tc is not None:
+            tc['u.call'] += time.time() - t0
         return hidden  # 1 x n_nodes x n_dims
 
-    def get_initial_hidden(self):
+    def get_initial_hidden(self, tc=None):
+        if tc is not None:
+            t0 = time.time()
+
         with tf.name_scope(self.name):
             ent_idx = tf.expand_dims(tf.range(0, self.n_nodes), axis=0)  # 1 x n_nodes
             ent_emb = self.entity_embedding(ent_idx)  # 1 x n_nodes x n_dims
@@ -289,11 +368,14 @@ class UnconsciousnessFlow(keras.Model):
             zeros = tf.zeros((1, self.n_nodes, self.n_dims))  # 1 x n_nodes x n_dims
             hidden_init = self.f_hidden((zeros, zeros, ent_emb))
             hidden_init = self.g_hidden(hidden_init)
+
+        if tc is not None:
+            tc['u.init'] += time.time() - t0
         return hidden_init  # 1 x n_nodes x n_dims
 
 
 class ConsciousnessFlow(keras.Model):
-    def __init__(self, n_entities, n_relations, n_dims, l2_factor):
+    def __init__(self, n_entities, n_relations, n_dims, ent_emb_l2, rel_emb_l2):
         """ n_entities: including virtual nodes
             n_relations: including 'virtual', 'selfloop' and 'backtrace'
         """
@@ -302,10 +384,10 @@ class ConsciousnessFlow(keras.Model):
         self.n_dims = n_dims
 
         self.entity_embedding = keras.layers.Embedding(n_entities, self.n_dims,
-                                                       embeddings_regularizer=keras.regularizers.l2(l2_factor),
+                                                       embeddings_regularizer=keras.regularizers.l2(ent_emb_l2),
                                                        name='entitys')
         self.relation_embedding = keras.layers.Embedding(n_relations, self.n_dims,
-                                                         embeddings_regularizer=keras.regularizers.l2(l2_factor),
+                                                         embeddings_regularizer=keras.regularizers.l2(rel_emb_l2),
                                                          name='relations')
 
         # f(head_emb, rel_emb)
@@ -326,33 +408,33 @@ class ConsciousnessFlow(keras.Model):
         # f(trans_attention, message)
         self.f_attended_message = F([[0, 1]], self.n_dims, use_bias=False, name='f_att_msg')
 
-        self.nodes_to_edges = N2E()
+        self.nodes_to_edges_v2 = Node2Edge_v2()
 
-        self.aggregate = Aggregate()
+        self.aggregate_v2 = Aggregate_v2()
 
     def call(self, inputs, selected_edges=None, edges_y=None, trans_attention=None, node_attention=None,
-             hidden_uncon=None, training=None):
-        """ inputs (hidden): batch_size x n_nodes x n_dims
-            selected_edges: n_selected_edges x 6 ( int32, selected_edges[i] = (idx, vi, vj, rel, idx_vi, idx_vj), sorted by idx, vi, vj )
+             hidden_uncon=None, visited_nodes=None, training=None, tc=None):
+        """ inputs (hidden): n_visited_nodes x n_dims
+            selected_edges: n_selected_edges x 8 ( int32, selected_edges[i] = (idx, vi, vj, rel, idx_vi, idx_vj, new_idx_e2vi, new_idx_e2vj), sorted by idx, vi, vj )
                 * including selfloop edges and backtrace edges
                 * batch_size >= 1
             edges_y: n_selected_edges ( sorted according to selected_edges )
             trans_attention: n_selected_edges ( sorted according to selected_edges )
             node_attention: batch_size x n_nodes
             hidden_uncon: 1 x n_nodes x n_dims
+            visited_nodes: n_visited_nodes x 2, (idx, v)
         """
         assert selected_edges is not None
         assert edges_y is not None
         assert trans_attention is not None
         assert node_attention is not None
         assert hidden_uncon is not None
-
-        ent_idx = tf.expand_dims(tf.range(0, self.n_nodes), axis=0)  # 1 x n_nodes
-        ent_emb = self.entity_embedding(ent_idx)  # 1 x n_nodes x n_dims
+        if tc is not None:
+            t0 = time.time()
 
         # compute conscious messages
         hidden = inputs
-        hidden_vi, hidden_vj = self.nodes_to_edges(hidden, selected_edges)  # n_selected_edges x n_dims
+        hidden_vi, hidden_vj = self.nodes_to_edges_v2(hidden, selected_edges)  # n_selected_edges x n_dims
         rel_idx = selected_edges[:, 3]  # n_selected_edges
         rel_emb = self.relation_embedding(rel_idx)  # n_selected_edges x n_dims
         message = self.f_message((hidden_vi, rel_emb, hidden_vj))  # n_selected_edges x n_dims
@@ -363,95 +445,111 @@ class ConsciousnessFlow(keras.Model):
         message = self.f_attended_message((tf.expand_dims(trans_attention, 1), message))  # n_selected_edges x n_dims
 
         # aggregate conscious messages
-        batch_size = tf.shape(inputs)[0]
-        message_aggr = self.aggregate(message, selected_edges=selected_edges,
-                                      output_shape=(batch_size, self.n_nodes, self.n_dims))  # batch_size x n_nodes x n_dims
+        n_visited_nodes = tf.shape(hidden)[0]
+        message_aggr = self.aggregate_v2(message, selected_edges=selected_edges,
+                                         output_shape=(n_visited_nodes, self.n_dims))  # n_visited_nodes x n_dims
 
         # update conscious messages
-        hidden_uncon = hidden_uncon * tf.expand_dims(node_attention, 2)  # batch_size x n_nodes x n_dims
-        ent_emb = tf.tile(ent_emb, [batch_size, 1, 1])  # batch_size x n_nodes x n_dims
-        update = self.f_hidden((message_aggr, hidden_uncon, hidden, ent_emb))  # batch_size x n_nodes x n_dims
+        idx, v = visited_nodes[:, 0], visited_nodes[:, 1]  # n_visited_nodes, n_visited_nodes
+        v_emb = self.entity_embedding(v)  # n_visited_nodes x n_dims
+        hidden_uncon = tf.squeeze(hidden_uncon, axis=0)  # n_nodes x n_dims
+        hidden_uncon = tf.gather(hidden_uncon, v)  # n_visited_nodes x n_dims
+        update = self.f_hidden((message_aggr, hidden_uncon, hidden, v_emb))  # n_visited_nodes x n_dims
         update = self.g_hidden(update)
         hidden = hidden + update
-        return hidden  # batch_size x n_nodes x n_dims
 
-    def get_query_context(self, heads, rels):
+        if tc is not None:
+            tc['c.call'] += time.time() - t0
+        return hidden  # n_visited_nodes x n_dims
+
+    def get_query_context(self, heads, rels, tc=None):
         """ heads: batch_size
             rels: batch_size
         """
+        if tc is not None:
+            t0 = time.time()
+
         with tf.name_scope(self.name):
             head_emb = self.entity_embedding(heads)  # batch_size x n_dims
             rel_emb = self.relation_embedding(rels)  # batch_size x n_dims
             query_context = self.f_query((head_emb, rel_emb))
             query_context = self.g_query(query_context)
+
+        if tc is not None:
+            tc['c.query'] += time.time() - t0
         return query_context  # batch_size x n_dims
 
-    def get_initial_hidden(self, query_context, hidden_uncon, node_attention):
+    def get_initial_hidden(self, query_context, hidden_uncon, selected_v, tc=None):
         """ query_context: batch_size x n_dims
             hidden_uncon: 1 x n_nodes x n_dims
-            node_attention: batch_size x n_nodes
+            selected_v: n_selected_nodes (=batch_size) x 2, (idx, v)
         """
-        with tf.name_scope(self.name):
-            ent_idx = tf.expand_dims(tf.range(0, self.n_nodes), axis=0)  # 1 x n_nodes
-            ent_emb = self.entity_embedding(ent_idx)  # 1 x n_nodes x n_dims
+        if tc is not None:
+            t0 = time.time()
 
-            batch_size = tf.shape(query_context)[0]
-            message = tf.expand_dims(query_context, 1) * tf.expand_dims(node_attention, 2)  # batch_size x n_nodes x n_dims
-            hidden_uncon = hidden_uncon * tf.expand_dims(node_attention, 2)  # batch_size x n_nodes x n_dims
-            zeros = tf.zeros_like(hidden_uncon)  # batch_size x n_nodes x n_dims
-            ent_emb = tf.tile(ent_emb, [batch_size, 1, 1])  # batch_size x n_nodes x n_dims
-            hidden_init = self.f_hidden((message, hidden_uncon, zeros, ent_emb))
+        with tf.name_scope(self.name):
+            idx, v = selected_v[:, 0], selected_v[:, 1]  # n_selected_nodes, n_selected_nodes
+            v_emb = self.entity_embedding(v)  # n_selected_nodes x n_dims
+            message = tf.gather(query_context, idx)  # n_selected_nodes x n_dims
+            hidden_uncon = tf.squeeze(hidden_uncon, axis=0)  # n_nodes x n_dims
+            hidden_uncon = tf.gather(hidden_uncon, v)  # n_selected_nodes x n_dims
+            zeros = tf.zeros_like(hidden_uncon)  # n_selected_nodes x n_dims
+            hidden_init = self.f_hidden((message, hidden_uncon, zeros, v_emb))
             hidden_init = self.g_hidden(hidden_init)
-        return hidden_init  # batch_size x n_nodes x n_dims
+
+        if tc is not None:
+            tc['c.init'] += time.time() - t0
+        return hidden_init  # n_selected_nodes x n_dims
 
 
 class AttentionFlow(keras.Model):
-    def __init__(self, n_entities, n_relations, n_dims, l2_factor):
+    def __init__(self, n_entities, n_relations, n_dims, rel_emb_l2):
         super(AttentionFlow, self).__init__(name='att_flow')
         self.n_nodes = n_entities
         self.n_dims = n_dims
 
         self.relation_embedding = keras.layers.Embedding(n_relations, self.n_dims,
-                                                         embeddings_regularizer=keras.regularizers.l2(l2_factor),
+                                                         embeddings_regularizer=keras.regularizers.l2(rel_emb_l2),
                                                          name='relations')
-        # f(hidden_con_vi, rel_emb, hidden_con_vj, hidden_uncon_vj)
-        self.f_transition = F([[0, 2], [0, 1, 2], [0, 3], [0, 1, 3]], self.n_dims,
+        # f(hidden_con_vi, hidden_uncon_vi, rel_emb, hidden_con_vj, hidden_uncon_vj)
+        self.f_transition = F([[0, 3], [0, 2, 3], [0, 4], [0, 2, 4], [1, 3], [1, 2, 3], [1, 4], [1, 2, 4]], self.n_dims,
                               activation=tf.nn.relu, output_weight=True, output_bias=True, name='f_trans')
 
-        self.nodes_to_edges = N2E()
+        self.nodes_to_edges = Node2Edge()
+        self.nodes_to_edges_v2 = Node2Edge_v2()
 
-        self.normalize = Normalize()
+        self.neighbor_softmax = NeighborSoftmax()
 
         self.aggregate = Aggregate()
 
-    def call(self, inputs, selected_edges=None, edges_y=None, hidden_con=None, hidden_uncon=None, training=None):
+    def call(self, inputs, selected_edges=None, edges_y=None, hidden_con=None, hidden_uncon=None, training=None, tc=None):
         """ inputs (node_attention): batch_size x n_nodes
-            selected_edges: n_selected_edges x 6 ( int32, selected_edges[i] = (idx, vi, vj, rel, idx_vi, idx_vj), sorted by idx, vi, vj )
+            selected_edges: n_selected_edges x 8 ( int32, selected_edges[i] = (idx, vi, vj, rel, idx_vi, idx_vj, new_idx_e2vi, new_idx_e2vj), sorted by idx, vi, vj )
                 * including selfloop edges and backtrace edges
                 * batch_size >= 1
             edges_y: n_selected_edges ( sorted according to selected_edges )
-            hidden_con: batch_size x n_nodes x n_dims
+            hidden_con: n_visited_nodes x n_dims
             hidden_uncon: 1 x n_nodes x n_dims
         """
         assert selected_edges is not None
         assert edges_y is not None
         assert hidden_con is not None
         assert hidden_uncon is not None
+        if tc is not None:
+            t0 = time.time()
 
         # compute transition
-        hidden_con_vi, hidden_con_vj = self.nodes_to_edges(hidden_con, selected_edges)  # n_selected_edges x n_dims
+        hidden_con_vi, hidden_con_vj = self.nodes_to_edges_v2(hidden_con, selected_edges)  # n_selected_edges x n_dims
 
-        batch_size = tf.shape(inputs)[0]
-        hidden_uncon = tf.tile(hidden_uncon, [batch_size, 1, 1])  # batch_size x n_nodes x n_dims
-        _, hidden_uncon_vj = self.nodes_to_edges(hidden_uncon, selected_edges)  # n_selected_edges x n_dims
+        hidden_uncon_vi, hidden_uncon_vj = self.nodes_to_edges(hidden_uncon, selected_edges)  # n_selected_edges x n_dims
 
         rel_idx = selected_edges[:, 3]  # n_selected_edges
         rel_emb = self.relation_embedding(rel_idx)  # n_selected_edges x n_dims
 
-        transition_logits = self.f_transition((hidden_con_vi, rel_emb, hidden_con_vj, hidden_uncon_vj))  # n_selected_edges x n_dims
+        transition_logits = self.f_transition((hidden_con_vi, hidden_uncon_vi, rel_emb, hidden_con_vj, hidden_uncon_vj))  # n_selected_edges x n_dims
         transition_logits = tf.reduce_sum(transition_logits, axis=1)  # n_selected_edges
 
-        transition = self.normalize(transition_logits, selected_edges=selected_edges)  # n_selected_edges
+        transition = self.neighbor_softmax(transition_logits, selected_edges=selected_edges)  # n_selected_edges
 
         # compute transition attention
         node_attention = inputs  # batch_size x n_nodes
@@ -464,12 +562,21 @@ class AttentionFlow(keras.Model):
         new_node_attention = self.aggregate(trans_attention, selected_edges=selected_edges,  # batch_size x n_nodes
                                             output_shape=(batch_size, self.n_nodes),
                                             at='vj', aggr_op='sum')
+
+        if tc is not None:
+            tc['a.call'] += time.time() - t0
         return trans_attention, new_node_attention
 
-    def get_initial_node_attention(self, heads):
+    def get_initial_node_attention(self, heads, tc=None):
+        if tc is not None:
+            t0 = time.time()
+
         with tf.name_scope(self.name):
             node_attention = tf.one_hot(heads, self.n_nodes)  # batch_size x n_nodes
-            return node_attention
+
+        if tc is not None:
+            tc['a.init'] += time.time() - t0
+        return node_attention
 
 
 class Model(object):
@@ -478,55 +585,86 @@ class Model(object):
         self.hparams = hparams
 
         self.sampler = Sampler(graph)
-        self.uncon_flow = UnconsciousnessFlow(graph.n_entities, graph.n_relations, hparams.n_dims, hparams.l2_factor)
-        self.con_flow = ConsciousnessFlow(graph.n_entities, graph.n_aug_relations, hparams.n_dims, hparams.l2_factor)
-        self.att_flow = AttentionFlow(graph.n_entities, graph.n_aug_relations, hparams.n_dims, hparams.l2_factor)
+        self.uncon_flow = UnconsciousnessFlow(graph.n_entities, graph.n_relations, hparams.n_dims,
+                                              hparams.ent_emb_l2, hparams.rel_emb_l2)
+        self.con_flow = ConsciousnessFlow(graph.n_entities, graph.n_aug_relations, hparams.n_dims,
+                                          hparams.ent_emb_l2, hparams.rel_emb_l2)
+        self.att_flow = AttentionFlow(graph.n_entities, graph.n_aug_relations, hparams.n_dims,
+                                      hparams.rel_emb_l2)
 
-    def initialize(self, heads, rels, init_uncon_steps=None):
+    def initialize(self, heads, rels, init_uncon_steps=None, time_cost=None):
+        """ heads: batch_size
+            rels: batch_size
+        """
+        ''' initialize unconsciousness flow '''
         hidden_uncon = self.uncon_flow.get_initial_hidden()  # 1 x n_nodes x n_dims
 
+        ''' run unconsciousness flow initially for multiple steps '''
         if init_uncon_steps is not None:
             for _ in range(init_uncon_steps):
-                # sampled_edges: n_sampled_edges x 2 ( int32, outputs[i] = (eg_idx, edge_id) )
-                # edges_y: n_sampled_edges ( float32, edges_y[i] = y )
+                # sampled_edges: n_sampled_edges x 2, (eg_idx, edge_id)
+                # edges_y: n_sampled_edges
                 sampled_edges, edges_y = self.sampler(self.graph.get_graph_edges(),
-                                                      max_edges=self.hparams.max_sampled_edges)
-
-                # selected_edges: n_selected_edges x 6 ( int32, selected_edges[i] = (idx, vi, vj, rel, idx_vi, idx_vj),
-                #   sorted by (idx, vi, vj), batch_size = 1 )
-                selected_edges, sorted_idx = self.graph.get_selected_edges(sampled_edges)
+                                                      max_edges=self.hparams.max_sampled_edges,
+                                                      tc=time_cost['model'] if time_cost else None)
+                # selected_edges: n_selected_edges (=n_sampled_edges) x 6, (idx=1, vi, vj, rel, idx_vi, idx_vj) sorted by (idx, vi, vj)
+                selected_edges, sorted_idx = self.graph.get_selected_edges(sampled_edges,
+                                                                           tc=time_cost['graph'] if time_cost else None)
                 edges_y = tf.gather(edges_y, sorted_idx)
 
-                hidden_uncon = self.uncon_flow(hidden_uncon, selected_edges=selected_edges, edges_y=edges_y)
+                hidden_uncon = self.uncon_flow(hidden_uncon, selected_edges=selected_edges, edges_y=edges_y,
+                                               tc=time_cost['model'] if time_cost else None)  # 1 x n_nodes x n_dims
 
-        node_attention = self.att_flow.get_initial_node_attention(heads)
+        ''' initialize attention flow '''
+        node_attention = self.att_flow.get_initial_node_attention(heads)  # batch_size x n_nodes
 
-        query_context = self.con_flow.get_query_context(heads, rels)
-        hidden_con = self.con_flow.get_initial_hidden(query_context, hidden_uncon, node_attention)
+        ''' initialize consciousness flow '''
+        query_context = self.con_flow.get_query_context(heads, rels)  # batch_size x n_dims
+        selected_v = self.graph.get_initial_selected_nodes(heads)  # n_selected_nodes (=batch_size) x 2, (idx, v)
+        hidden_con = self.con_flow.get_initial_hidden(query_context, hidden_uncon, selected_v)  # n_selected_nodes x n_dims
 
         self.graph.reset_past_transitions()
+        self.graph.reset_visited_nodes(selected_v)
 
+        # hidden_uncon: 1 x n_nodes x n_dims
+        # hidden_con: n_selected_nodes
+        # node_attention: batch_size x n_nodes
         return hidden_uncon, hidden_con, node_attention
 
-    def flow(self, hidden_uncon, hidden_con, node_attention, step, stop_uncon_steps=False):
+    def flow(self, hidden_uncon, hidden_con, node_attention, step, stop_uncon_steps=False, time_cost=None):
         """ hidden_uncon: 1 x n_nodes x n_dims
-            hidden_con: batch_size x n_nodes x n_dims
+            hidden_con: n_visited_nodes x n_dims
             node_attention: batch_size x n_nodes
         """
+        ''' run unconsciousness flow '''
         if not stop_uncon_steps:
+            # sampled_edges: n_sampled_edges x 2, (eg_idx, edge_id)
+            # edges_y: n_sampled_edges
             sampled_edges, edges_y = self.sampler(self.graph.get_graph_edges(),
-                                                  max_edges=self.hparams.max_sampled_edges)
-            selected_edges, sorted_idx = self.graph.get_selected_edges(sampled_edges)
+                                                  max_edges=self.hparams.max_sampled_edges,
+                                                  tc=time_cost['model'] if time_cost else None)
+            # selected_edges: n_selected_edges (=n_sampled_edges) x 6, (idx=1, vi, vj, rel, idx_vi, idx_vj) sorted by (idx, vi, vj)
+            selected_edges, sorted_idx = self.graph.get_selected_edges(sampled_edges,
+                                                                       tc=time_cost['graph'] if time_cost else None)
             edges_y = tf.gather(edges_y, sorted_idx)
-            new_hidden_uncon = self.uncon_flow(hidden_uncon, selected_edges=selected_edges, edges_y=edges_y)
+
+            new_hidden_uncon = self.uncon_flow(hidden_uncon, selected_edges=selected_edges, edges_y=edges_y,
+                                               tc=time_cost['model'] if time_cost else None)  # 1 x n_nodes x n_dims
         else:
-            new_hidden_uncon = hidden_uncon
+            new_hidden_uncon = hidden_uncon  # 1 x n_nodes x n_dims
 
-        attended_nodes = self.graph.get_attended_nodes(node_attention, self.hparams.max_attended_nodes)  # n_attended_nodes x 2
-        attended_edges = self.graph.get_attended_edges(attended_nodes)  # n_attended_edges x 2
-        sampled_edges, edges_y = self.sampler(attended_edges, max_edges=self.hparams.max_attended_edges)
-
-        selected_edges, sorted_idx = self.graph.get_selected_edges(sampled_edges)  # selected_edges: n_selected_edges x 6
+        ''' get attended edges '''
+        attended_nodes = self.graph.get_attended_nodes(node_attention, self.hparams.max_attended_nodes,
+                                                       tc=time_cost['graph'] if time_cost else None)  # n_attended_nodes x 2
+        attended_edges = self.graph.get_attended_edges(attended_nodes,
+                                                       tc=time_cost['graph'] if time_cost else None)  # n_attended_edges x 2
+        # sampled_edges: n_attended_edges x 2, (eg_idx, edge_id)
+        # edges_y: n_attended_edges
+        sampled_edges, edges_y = self.sampler(attended_edges, max_edges=self.hparams.max_attended_edges,
+                                              tc=time_cost['model'] if time_cost else None)
+        # selected_edges: n_selected_edges (=n_attended_edges) x 6, (idx, vi, vj, rel, idx_vi, idx_vj) sorted by (idx, vi, vj)
+        selected_edges, sorted_idx = self.graph.get_selected_edges(sampled_edges,
+                                                                   tc=time_cost['graph'] if time_cost else None)
         edges_y = tf.gather(edges_y, sorted_idx)
 
         attended_node_attention = tf.gather_nd(node_attention, attended_nodes)  # n_attended_nodes
@@ -534,26 +672,43 @@ class Model(object):
                                                                                 attended_node_attention,
                                                                                 self.hparams.max_backtrace_edges,
                                                                                 step,
+                                                                                tc=time_cost['graph'] if time_cost else None,
                                                                                 backtrace_decay=self.hparams.backtrace_decay)
 
+        ''' add selfloop and backtrace edges '''
+        # aug_selected_edges: n_aug_selected_edges x 6
         aug_selected_edges, new_idx_for_edges_y, rest_idx = self.graph.get_union_edges(selected_edges,
                                                                                        selfloop_edges,
-                                                                                       backtrace_edges)
+                                                                                       backtrace_edges,
+                                                                                       tc=time_cost['graph'] if time_cost else None)
         edges_y = tf.scatter_nd(new_idx_for_edges_y, edges_y, tf.TensorShape((aug_selected_edges.shape[0],)))
         rest_y = tf.scatter_nd(rest_idx, tf.ones((rest_idx.shape[0],)), tf.TensorShape((aug_selected_edges.shape[0],)))
         edges_y = edges_y + rest_y
 
+        ''' update visited nodes '''
+        new_idx_for_previous, _, n_visited_nodes = self.graph.update_visited_nodes(selected_edges,
+                                                                                   tc=time_cost['graph'] if time_cost else None)
+        hidden_con = tf.scatter_nd(new_idx_for_previous, hidden_con,
+                                   tf.TensorShape((n_visited_nodes, self.hparams.n_dims)))  # n_visited_nodes (new) x n_dims
+        aug_selected_edges = self.graph.index_visited_nodes(aug_selected_edges,
+                                                            tc=time_cost['graph'] if time_cost else None)  # n_aug_selected_edges x 8
+
+        ''' run attention flow '''
         trans_attention, new_node_attention = self.att_flow(node_attention, selected_edges=aug_selected_edges,
                                                             edges_y=edges_y, hidden_con=hidden_con,
-                                                            hidden_uncon=hidden_uncon)
-
+                                                            hidden_uncon=hidden_uncon,
+                                                            tc=time_cost['model'] if time_cost else None)  # n_selected_edges, batch_size x n_nodes
+        ''' run consciousness flow '''
         new_hidden_con = self.con_flow(hidden_con, selected_edges=aug_selected_edges, edges_y=edges_y,
-                                       trans_attention=trans_attention, node_attention=node_attention,
-                                       hidden_uncon=hidden_uncon)
+                                       trans_attention=trans_attention, node_attention=new_node_attention,
+                                       hidden_uncon=hidden_uncon, visited_nodes=self.graph.visited_nodes,
+                                       tc=time_cost['model'] if time_cost else None)  # n_visited_nodes x n_dims
 
+        ''' do storing work at the end of each step '''
         selected_trans_att = tf.gather_nd(trans_attention, new_idx_for_edges_y)
         self.graph.store_transitions(selected_edges, selected_trans_att, step)
 
+        # new_hidden_uncon: 1 x n_nodes x n_dims, new_hidden_con: n_visited_nodes x n_dims, new_node_attention: batch_size x n_nodes
         return new_hidden_uncon, new_hidden_con, new_node_attention
 
     @property

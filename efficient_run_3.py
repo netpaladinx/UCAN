@@ -7,81 +7,35 @@ import numpy as np
 import tensorflow as tf
 from tensorflow.python.keras.api._v2 import keras
 
-from model import Model
-from dataenv import DataEnv
-import datasets as datasets
+from efficient_model_3 import Model
+from efficient_data_env_3 import DataEnv
+import datasets
 
 parser = argparse.ArgumentParser()
-
-
-parser.add_argument('-bs', '--batch_size', type=int, default=100)
-parser.add_argument('--n_dims_sm', type=int, default=10)
-parser.add_argument('--n_dims', type=int, default=100)
-parser.add_argument('--n_dims_lg', type=int, default=500)
+parser.add_argument('-bs', '--batch_size', type=int, default=20)
+parser.add_argument('--n_dims', type=int, default=50)
 parser.add_argument('--ent_emb_l2', type=float, default=0.)
 parser.add_argument('--rel_emb_l2', type=float, default=0.)
-parser.add_argument('--max_edges_per_example', type=int, default=10000)
-parser.add_argument('--max_attended_nodes', type=int, default=10)
-parser.add_argument('--max_edges_per_node', type=int, default=100)
-parser.add_argument('--max_backtrace_edges', type=int, default=10)
+parser.add_argument('--max_sampled_edges', type=int, default=10000)
+parser.add_argument('--max_attended_nodes', type=int, default=200)
+parser.add_argument('--max_attended_edges', type=int, default=2000)
+parser.add_argument('--max_backtrace_edges', type=int, default=200)
 parser.add_argument('--backtrace_decay', type=float, default=0.9)
-parser.add_argument('--max_seen_nodes', type=int, default=100)
 parser.add_argument('--max_epochs', type=int, default=10)
-parser.add_argument('--n_clustering', type=int, default=10)
-parser.add_argument('--n_clusters_per_clustering', type=int, default=10)
-parser.add_argument('--connected_clustering', action='store_true', default=True)
-parser.add_argument('--init_uncon_steps_per_graph', type=int, default=10)
-parser.add_argument('--init_uncon_steps_per_batch', type=int, default=1)
-parser.add_argument('--simultaneous_uncon_flow', action='store_true', default=False)
-parser.add_argument('--max_steps', type=int, default=10)
-#parser.add_argument('--step_weights', default='0.05,0.05,0.05,0.05,0.8')
-parser.add_argument('--learning_rate', type=float, default=0.005)
-parser.add_argument('--dataset', default='FB237')
-parser.add_argument('--timer', action='store_true', default=False)
-parser.add_argument('--print_train', action='store_true', default=True)
-
-"""
-parser.add_argument('-bs', '--batch_size', type=int, default=30)
-parser.add_argument('--n_dims_sm', type=int, default=10)
-parser.add_argument('--n_dims', type=int, default=50)
-parser.add_argument('--n_dims_lg', type=int, default=50)
-parser.add_argument('--ent_emb_l2', type=float, default=0.1)
-parser.add_argument('--rel_emb_l2', type=float, default=0.1)
-parser.add_argument('--max_edges_per_example', type=int, default=1000)
-parser.add_argument('--max_attended_nodes', type=int, default=5)
-parser.add_argument('--max_edges_per_node', type=int, default=10)
-parser.add_argument('--max_backtrace_edges', type=int, default=10)
-parser.add_argument('--backtrace_decay', type=float, default=0.9)
-parser.add_argument('--max_seen_nodes', type=int, default=50)
-parser.add_argument('--max_epochs', type=int, default=10)
-parser.add_argument('--n_clustering', type=int, default=1)
-parser.add_argument('--n_clusters_per_clustering', type=int, default=100)
-parser.add_argument('--connected_clustering', action='store_true', default=True)
+parser.add_argument('--n_virtual_nodes', type=int, default=10)
 parser.add_argument('--init_uncon_steps_per_graph', type=int, default=10)
 parser.add_argument('--init_uncon_steps_per_batch', type=int, default=2)
 parser.add_argument('--simultaneous_uncon_flow', action='store_true', default=False)
 parser.add_argument('--max_steps', type=int, default=5)
-#parser.add_argument('--step_weights', default='0.05,0.05,0.05,0.05,0.8')
-parser.add_argument('--learning_rate', type=float, default=0.01)
-parser.add_argument('--dataset', default='Countries')
+parser.add_argument('--learning_rate', type=float, default=0.001)
+parser.add_argument('--dataset', default='FB237')
 parser.add_argument('--timer', action='store_true', default=False)
-parser.add_argument('--print_train', action='store_true', default=False)
-"""
 default_hparams = parser.parse_args()
 
 
 def loss_fn(predictions, tails):
-    """ predictions: (tf.Tensor) batch_size x n_nodes x n_steps
-        tails: (np.array) batch_size
-    """
-    # step_weights = list(map(lambda x: float(x), self.hparams.step_weights.split(',')))  # n_steps
-    # pred_idx = tf.stack([tf.range(0, len(tails)), tails], axis=1)  # batch_size x 2
-    # pred_prob = tf.gather_nd(predictions, pred_idx)  # batch_size x n_steps
-    # pred_loss = tf.reduce_mean(tf.reduce_sum(- tf.math.log(pred_prob + 1e-20) * step_weights, axis=1))
-
-    pred_idx = tf.stack([tf.range(0, len(tails)), tails], axis=1)  # batch_size x 2
-    pred_prob = tf.gather_nd(predictions[:, :, -1], pred_idx) if tf.rank(predictions) == 3 \
-        else tf.gather_nd(predictions, pred_idx)  # batch_size
+    pred_idx = tf.stack([tf.range(0, tf.shape(tails)[0]), tails], axis=1)
+    pred_prob = tf.gather_nd(predictions, pred_idx)
     pred_loss = tf.reduce_mean(- tf.math.log(pred_prob + 1e-20))
     return pred_loss
 
@@ -96,38 +50,37 @@ class Trainer(object):
         self.train_pred_loss = keras.metrics.Mean(name='train_pred_loss')
         self.train_accuracy = keras.metrics.SparseCategoricalAccuracy(name='train_accuracy')
 
-    def train_step(self, heads, tails, rels, tc=None):
+    def train_step(self, heads, rels, tails, time_cost=None):
         with tf.GradientTape() as tape:
             hidden_uncon, hidden_con, node_attention = \
-                self.model.init_per_batch(heads, rels, tc=tc)
+                self.model.init_per_batch(heads, rels, time_cost=time_cost)
             for step in range(1, self.hparams.max_steps + 1):
                 hidden_uncon, hidden_con, node_attention = \
-                    self.model.flow(hidden_uncon, hidden_con, node_attention, step, tc=tc)
+                    self.model.flow(hidden_uncon, hidden_con, node_attention, step, time_cost=time_cost)
             self.model.past_hidden_uncon = hidden_uncon
 
-            predictions = tf.stack(self.model.node_attention_trace[1:], axis=2)  # batch_size x n_nodes x n_steps
-            pred_loss = loss_fn(predictions, tails)
+            predictions = node_attention
+            pred_loss =loss_fn(predictions, tails)
             reg_loss = self.model.regularization_loss
             loss = pred_loss + reg_loss
 
-        if tc is not None:
+        if time_cost is not None:
             t0 = time.time()
         gradients = tape.gradient(loss, self.model.trainable_variables)
-        if tc is not None:
-            tc['grad']['comp'] += time.time() - t0
+        if time_cost is not None:
+            time_cost['grad']['comp'] += time.time() - t0
 
-        if tc is not None:
+        if time_cost is not None:
             t0 = time.time()
         self.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
-        if tc is not None:
-            tc['grad']['apply'] += time.time() - t0
+        if time_cost is not None:
+            time_cost['grad']['apply'] += time.time() - t0
 
-        final_prediction = predictions[:, :, -1]
         self.train_loss(loss)
         self.train_pred_loss(pred_loss)
-        self.train_accuracy(tails, final_prediction)
+        self.train_accuracy(tails, predictions)
 
-        accuracy = tf.reduce_mean(tf.cast(tf.equal(tf.argmax(final_prediction, axis=1), tails), tf.float32))
+        accuracy = tf.reduce_mean(tf.cast(tf.equal(tf.argmax(predictions, axis=1), tails), tf.float32))
         return loss, pred_loss, accuracy
 
     def reset_metric(self):
@@ -152,12 +105,12 @@ class Evaluator(object):
         self.eval_pred_loss = keras.metrics.Mean(name='eval_pred_loss')
         self.eval_accuracy = keras.metrics.SparseCategoricalAccuracy(name='eval_accuracy')
 
-    def eval_step(self, heads, tails, rels):
+    def eval_step(self, heads, rels, tails, time_cost=None):
         hidden_uncon, hidden_con, node_attention = \
             self.model.init_per_batch(heads, rels)
         for step in range(1, self.hparams.max_steps + 1):
             hidden_uncon, hidden_con, node_attention = \
-                self.model.flow(hidden_uncon, hidden_con, node_attention, step)
+                self.model.flow(hidden_uncon, hidden_con, node_attention, step, time_cost=time_cost)
         self.model.past_hidden_uncon = hidden_uncon
 
         self.heads.append(heads)
@@ -182,7 +135,6 @@ class Evaluator(object):
         self.relations = []
         self.predictions = []
         self.targets = []
-        self.eval_accuracy.reset_states()
 
     def metric_result(self):
         return self.eval_loss.result(), self.eval_pred_loss.result(), self.eval_accuracy.result()
@@ -240,11 +192,11 @@ def reset_time_cost(hparams):
         return None
 
 
-def str_time_cost(tc):
-    if tc is not None:
-        model_tc = ', '.join('m.{} {:3f}'.format(k, v) for k, v in tc['model'].items())
-        graph_tc = ', '.join('g.{} {:3f}'.format(k, v) for k, v in tc['graph'].items())
-        grad_tc = ', '.join('d.{} {:3f}'.format(k, v) for k, v in tc['grad'].items())
+def str_time_cost(time_cost):
+    if time_cost is not None:
+        model_tc = ', '.join('m.{} {:3f}'.format(k, v) for k, v in time_cost['model'].items())
+        graph_tc = ', '.join('g.{} {:3f}'.format(k, v) for k, v in time_cost['graph'].items())
+        grad_tc = ', '.join('d.{} {:3f}'.format(k, v) for k, v in time_cost['grad'].items())
         return model_tc + ', ' + graph_tc + ', ' + grad_tc
     else:
         return ''
@@ -271,35 +223,35 @@ def run(dataset, hparams):
                 t0 = time.time()
                 time_cost = reset_time_cost(hparams)
 
-                heads, tails, rels = train_batch[:, 0], train_batch[:, 1], train_batch[:, 2]
-                cur_train_loss, cur_pred_loss, cur_accuracy = trainer.train_step(heads, tails, rels,
-                                                                                 tc=time_cost)
+                heads, rels, tails = train_batch[:, 0], train_batch[:, 1], train_batch[:, 2]
+                cur_train_loss, cur_pred_loss, cur_accuracy = trainer.train_step(heads, rels, tails,
+                                                                                 time_cost=time_cost)
 
                 train_loss, pred_loss, accuracy = trainer.metric_result()
                 dt = time.time() - t0
 
-                if hparams.print_train:
-                    print('{:d}, {:d}, {:d} | tr_ls: {:.4f} ({:.4f}) | pr_ls: {:.4f} ({:.4f}) | acc: {:.4f} ({:.4f}) |'
-                          ' t: {:3f} | {}'.format(epoch, graph_i, batch_i,
-                                                  train_loss.numpy(), cur_train_loss,
-                                                  pred_loss.numpy(), cur_pred_loss,
-                                                  accuracy.numpy(), cur_accuracy,
-                                                  dt,
-                                                  str_time_cost(time_cost)))
+                print('{:d}, {:d}, {:d} | tr_ls: {:.4f} ({:.4f}) | pr_ls: {:.4f} ({:.4f}) | acc: {:.4f} ({:.4f}) |'
+                      ' t: {:3f} | {}'.format(epoch, graph_i, batch_i,
+                                              train_loss.numpy(), cur_train_loss,
+                                              pred_loss.numpy(), cur_pred_loss,
+                                              accuracy.numpy(), cur_accuracy,
+                                              dt,
+                                              str_time_cost(time_cost)))
                 batch_i += 1
 
             graph_i += 1
 
         data_env.graph.use_full_edges()
-        valid_batcher = data_env.get_valid_batcher()
         model.init_per_graph()
+
+        valid_batcher = data_env.get_valid_batcher()
         batch_i = 1
         for valid_batch, batch_size in valid_batcher(hparams.batch_size):
             t0 = time.time()
             time_cost = reset_time_cost(hparams)
 
-            heads, tails, rels = valid_batch[:, 0], valid_batch[:, 1], valid_batch[:, 2]
-            cur_eval_loss, cur_pred_loss, cur_accuracy = evaluator.eval_step(heads, tails, rels)
+            heads, rels, tails = valid_batch[:, 0], valid_batch[:, 1], valid_batch[:, 2]
+            cur_eval_loss, cur_pred_loss, cur_accuracy = evaluator.eval_step(heads, rels, tails, time_cost=time_cost)
 
             eval_loss, pred_loss, accuracy = evaluator.metric_result()
             dt = time.time() - t0
@@ -314,7 +266,7 @@ def run(dataset, hparams):
             batch_i += 1
 
         hit_1, hit_3, hit_5, hit_10, mr, mrr, max_r = evaluator.final_metric_result()
-        print('epoch: {:d} | hit_1: {:.6f} | hit_3: {:.6f} | hit_5: {:.6f} | hit_10: {:.6f} | mr: {:.1f} | mmr: {:6f} | '
+        print('[FINAL EVAL] epoch: {:d} | hit_1: {:.6f} | hit_3: {:.6f} | hit_5: {:.6f} | hit_10: {:.6f} | mr: {:.1f} | mmr: {:6f} |'
               'max_r: {:1f}'
               .format(epoch, hit_1, hit_3, hit_5, hit_10, mr, mrr, max_r))
 
