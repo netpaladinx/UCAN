@@ -7,13 +7,13 @@ import numpy as np
 import tensorflow as tf
 from tensorflow.python.keras.api._v2 import keras
 
-from efficient_model_5 import Model
 from efficient_data_env_5 import DataEnv
+from efficient_model_5 import Model
 import datasets_5 as datasets
 
 parser = argparse.ArgumentParser()
 
-
+"""
 parser.add_argument('-bs', '--batch_size', type=int, default=100)
 parser.add_argument('--n_dims_sm', type=int, default=10)
 parser.add_argument('--n_dims', type=int, default=100)
@@ -39,9 +39,9 @@ parser.add_argument('--learning_rate', type=float, default=0.005)
 parser.add_argument('--dataset', default='FB237')
 parser.add_argument('--timer', action='store_true', default=False)
 parser.add_argument('--print_train', action='store_true', default=True)
-
 """
-parser.add_argument('-bs', '--batch_size', type=int, default=30)
+
+parser.add_argument('-bs', '--batch_size', type=int, default=50)
 parser.add_argument('--n_dims_sm', type=int, default=10)
 parser.add_argument('--n_dims', type=int, default=50)
 parser.add_argument('--n_dims_lg', type=int, default=50)
@@ -49,7 +49,7 @@ parser.add_argument('--ent_emb_l2', type=float, default=0.1)
 parser.add_argument('--rel_emb_l2', type=float, default=0.1)
 parser.add_argument('--max_edges_per_example', type=int, default=1000)
 parser.add_argument('--max_attended_nodes', type=int, default=5)
-parser.add_argument('--max_edges_per_node', type=int, default=10)
+parser.add_argument('--max_edges_per_node', type=int, default=50)
 parser.add_argument('--max_backtrace_edges', type=int, default=10)
 parser.add_argument('--backtrace_decay', type=float, default=0.9)
 parser.add_argument('--max_seen_nodes', type=int, default=50)
@@ -60,13 +60,13 @@ parser.add_argument('--connected_clustering', action='store_true', default=True)
 parser.add_argument('--init_uncon_steps_per_graph', type=int, default=10)
 parser.add_argument('--init_uncon_steps_per_batch', type=int, default=2)
 parser.add_argument('--simultaneous_uncon_flow', action='store_true', default=False)
-parser.add_argument('--max_steps', type=int, default=5)
+parser.add_argument('--max_steps', type=int, default=20)
 #parser.add_argument('--step_weights', default='0.05,0.05,0.05,0.05,0.8')
 parser.add_argument('--learning_rate', type=float, default=0.01)
 parser.add_argument('--dataset', default='Countries')
 parser.add_argument('--timer', action='store_true', default=False)
-parser.add_argument('--print_train', action='store_true', default=False)
-"""
+parser.add_argument('--print_train', action='store_true', default=True)
+
 default_hparams = parser.parse_args()
 
 
