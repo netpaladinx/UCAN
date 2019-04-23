@@ -33,25 +33,25 @@ class Dataset(object):
         self.test = self._convert_to_id(test)
 
     def _load_file(self, filepath):
-        """ Return: string triples (head, relation, tail)
+        """ Return: string triples (head, tail, relation)
         """
         triples = []
         with open(filepath) as fin:
             for line in fin:
                 h, r, t = line.strip().split('\t')
-                triples.append((h, r, t))
+                triples.append((h, t, r))
         return triples
 
     def _make_dict(self, triples):
         ent2id, rel2id = {}, {}
         id2ent, id2rel = {}, {}
-        for h, r, t in triples:
+        for h, t, r in triples:
             ent2id.setdefault(h, len(ent2id))
             id2ent[ent2id[h]] = h
-            rel2id.setdefault(r, len(rel2id))
-            id2rel[rel2id[r]] = r
             ent2id.setdefault(t, len(ent2id))
             id2ent[ent2id[t]] = t
+            rel2id.setdefault(r, len(rel2id))
+            id2rel[rel2id[r]] = r
         return ent2id, id2ent, rel2id, id2rel
 
     def _split_into_train_valid_test(self, triples, split_ratio, shuffle=True):
@@ -67,90 +67,21 @@ class Dataset(object):
         return train, valid, test
 
     def _add_reverse_triples(self, triples):
-        return triples + [(t, '_' + r, h) for h, r, t in triples]
+        return triples + [(t, h, '_' + r) for h, t, r in triples]
 
     def _convert_to_id(self, triples):
-        return np.array([(self.entity2id[h], self.relation2id[r], self.entity2id[t])
-                         for h, r, t in triples], dtype='int32')
-
-    def stats(self):
-        ent_train = set()
-        rel_train = set()
-        n_rec = 0
-        with open(self.train_path) as fin:
-            for line in fin:
-                h, r, t = line.strip().split('\t')
-                ent_train.add(h)
-                rel_train.add(r)
-                ent_train.add(t)
-                n_rec = n_rec + 1
-        print('#entities in train: {}'.format(len(ent_train)))
-        print('#relations in train: {}'.format(len(rel_train)))
-        print('#records in train: {}'.format(n_rec))
-        print()
-
-        ent_valid = set()
-        rel_valid = set()
-        n_rec = 0
-        with open(self.valid_path) as fin:
-            for line in fin:
-                h, r, t = line.strip().split('\t')
-                ent_valid.add(h)
-                rel_valid.add(r)
-                ent_valid.add(t)
-                n_rec = n_rec + 1
-        print('#entities in valid: {}'.format(len(ent_valid)))
-        print('#relations in valid: {}'.format(len(rel_valid)))
-        print('#records in train: {}'.format(n_rec))
-        print()
-
-        ent_test = set()
-        rel_test = set()
-        n_rec = 0
-        with open(self.test_path) as fin:
-            for line in fin:
-                h, r, t = line.strip().split('\t')
-                ent_test.add(h)
-                rel_test.add(r)
-                ent_test.add(t)
-                n_rec = n_rec + 1
-        print('#entities in test: {}'.format(len(ent_test)))
-        print('#relations in test: {}'.format(len(rel_test)))
-        print('#records in train: {}'.format(n_rec))
-        print()
-
-        print('#entities in valid but not in train: {}'.format(len(ent_valid - ent_train)))
-        print('#relations in valid but not in train: {}'.format(len(rel_valid - rel_train)))
-        print()
-
-        print('#entities in test but not in train: {}'.format(len(ent_test - ent_train)))
-        print('#relations in test but not in train: {}'.format(len(rel_test - rel_train)))
-        print()
-
-        deg_train = defaultdict(lambda: np.zeros(3, dtype=np.int))
-        with open(self.train_path) as fin:
-            for line in fin:
-                h, r, t = line.strip().split('\t')
-                deg_train[h] = deg_train[h] + np.array([1, 0, 1])
-                deg_train[t] = deg_train[t] + np.array([0, 1, 1])
-
-        deg_train_np = np.stack(list(deg_train.values()))
-        print('max head degree in train: {} where head is {}'.format(deg_train_np[:, 0].max(),
-                                                                     list(deg_train.keys())[deg_train_np[:, 0].argmax()]))
-        print('max tail degree in train: {} where tail is {}'.format(deg_train_np[:, 1].max(),
-                                                                     list(deg_train.keys())[deg_train_np[:, 1].argmax()]))
-        print('max degree in train: {}'.format(deg_train_np[:, 2].max()))
-        print()
+        return np.array([(self.entity2id[h], self.entity2id[t], self.relation2id[r])
+                         for h, t, r in triples], dtype='int32')
 
 
 class FB237(Dataset):
     path = 'data/kbc/FB237'
 
-    def __init__(self):
+    def __init__(self, include_reverse=True):
         train_path = os.path.join(self.path, 'train')
         valid_path = os.path.join(self.path, 'valid')
         test_path = os.path.join(self.path, 'test')
-        super(FB237, self).__init__(train_path, valid_path, test_path, include_reverse=True)
+        super(FB237, self).__init__(train_path, valid_path, test_path, include_reverse=include_reverse)
 
 
 class YAGO310(Dataset):
@@ -166,14 +97,9 @@ class YAGO310(Dataset):
 class Countries(Dataset):
     path = 'data/MINERVA/countries'
 
-    def __init__(self, subname='_S1'):
+    def __init__(self, subname='_S1', include_reverse=True):
         self.path = Countries.path + subname
         train_path = os.path.join(self.path, 'train.txt')
         valid_path = os.path.join(self.path, 'dev.txt')
         test_path = os.path.join(self.path, 'test.txt')
-        super(Countries, self).__init__(train_path, valid_path, test_path, )
-
-
-if __name__ == '__main__':
-    yago310 = YAGO310()
-    yago310.stats()
+        super(Countries, self).__init__(train_path, valid_path, test_path, include_reverse=include_reverse)
