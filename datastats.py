@@ -268,7 +268,23 @@ def report_3(ds):
     stats.degree_histogram_report(ds.train)
 
 
+def report_4(ds):
+    graph = nx.Graph(ds.train[:, :2].tolist())
+    pos = nx.spring_layout(graph)
+    node_color = [float(graph.degree(v)) for v in graph]
+    edge_color = [node_color[vi] + node_color[vj] for vi, vj in graph.edges]
+    plt.figure(figsize=(24, 32))
+
+    nx.draw_networkx_nodes(graph, pos, node_size=200, node_color=node_color, alpha=0.4)
+    nx.draw_networkx_edges(graph, pos, alpha=0.3, edge_color=edge_color)
+    nx.draw_networkx_labels(graph, pos, font_size=8)
+
+    plt.axis('off')
+    plt.savefig('countries.pdf')
+    plt.show()
+
+
 if __name__ == '__main__':
     #ds = datasets.FB237()
     ds = datasets.Countries()
-    report_1(ds)
+    report_4(ds)

@@ -735,16 +735,8 @@ class Sampler(keras.Model):
         with tf.name_scope(self.name):
             with tf.device('/cpu:0'):
                 self.edges_logits = self.add_weight(shape=(graph.n_full_edges,),
-                                                    initializer=keras.initializers.constant(self._initialize(graph)),
+                                                    initializer=keras.initializers.zeros(),
                                                     name='edges_logits')  # n_full_edges
-
-    def _initialize(self, graph):
-        logits_init = np.zeros((graph.n_full_edges,), np.float32)
-        for e_id, vi, vj, rel in graph.full_edges:
-            logits_init[e_id] = np.log((1. / graph.count(vi)) *
-                                       (1. / graph.count((vi, rel))) *
-                                       (1. / graph.count((vi, rel, vj))))
-        return logits_init
 
     def call(self, _, candidate_edges=None, loglog_u=None, sampled_edges=None, mode=None, training=None, tc=None):
         """ inputs: None
@@ -778,7 +770,7 @@ class Sampler(keras.Model):
             tc['s.call'] += time.time() - t0
         return edges_y  # n_sampled_edges
 
-    def _gumbel_softmax(self, logits, loglog_u, segment_ids, ca_idx, temperature=1., hard=True):
+    def _gumbel_softmax(self, logits, loglog_u, segment_ids, ca_idx, temperature=0.1, hard=True):
         y = logits + loglog_u  # n_candidate_edges
         y = sparse_softmax(y / temperature, segment_ids)  # n_candidate_edges
         y = tf.gather(y, ca_idx)  # n_sampled_edges
@@ -853,7 +845,7 @@ class UnconsciousnessFlow(keras.Model):
         update = self.f_hidden((message_aggr, hidden, ent_emb))  # 1 x n_nodes x n_dims_lg
         update = self.g_hidden(update)  # 1 x n_nodes x n_dims_lg
         hidden = self.gru((hidden, update))  # 1 x n_nodes x n_dims_lg
-        #self.hidden = hidden
+        self.hidden = hidden
 
         if tc is not None:
             tc['u.call'] += time.time() - t0
@@ -1156,7 +1148,7 @@ class Model(object):
         # node_attention: batch_size x n_nodes
         return hidden_uncon, hidden_con, node_attention
 
-    def flow(self, hidden_uncon, hidden_con, node_attention, step, training=True, tc=None):
+    def flow(self, hidden_uncon, hidden_con, node_attention, training=True, tc=None):
         """ hidden_uncon: 1 x n_nodes x n_dims_lg
             hidden_con: n_memorized_nodes x n_dims
             node_attention: batch_size x n_nodes
@@ -1327,27 +1319,27 @@ parser.add_argument('--print_train', action='store_true', default=True)
 
 
 # Countries
-parser.add_argument('-bs', '--batch_size', type=int, default=8)
+parser.add_argument('-bs', '--batch_size', type=int, default=50)
 parser.add_argument('--n_dims_sm', type=int, default=10)
-parser.add_argument('--n_dims', type=int, default=50)
-parser.add_argument('--n_dims_lg', type=int, default=50)
-parser.add_argument('--ent_emb_l2', type=float, default=0.1)
-parser.add_argument('--rel_emb_l2', type=float, default=0.1)
-parser.add_argument('--max_edges_per_example', type=int, default=1000)
-parser.add_argument('--max_attended_nodes', type=int, default=1)
-parser.add_argument('--max_edges_per_node', type=int, default=2)
-parser.add_argument('--max_backtrace_nodes', type=int, default=5)
-parser.add_argument('--backtrace_decay', type=float, default=0.9)
-parser.add_argument('--max_seen_nodes', type=int, default=20)
-parser.add_argument('--max_epochs', type=int, default=10)
+parser.add_argument('--n_dims', type=int, default=20)
+parser.add_argument('--n_dims_lg', type=int, default=30)
+parser.add_argument('--ent_emb_l2', type=float, default=0.01)
+parser.add_argument('--rel_emb_l2', type=float, default=0.01)
+parser.add_argument('--max_edges_per_example', type=int, default=100)
+parser.add_argument('--max_attended_nodes', type=int, default=5)
+parser.add_argument('--max_edges_per_node', type=int, default=20)
+parser.add_argument('--max_backtrace_nodes', type=int, default=10)
+parser.add_argument('--backtrace_decay', type=float, default=1.)
+parser.add_argument('--max_seen_nodes', type=int, default=10)
+parser.add_argument('--max_epochs', type=int, default=100)
 parser.add_argument('--n_clustering', type=int, default=0)
 parser.add_argument('--n_clusters_per_clustering', type=int, default=0)
 parser.add_argument('--connected_clustering', action='store_true', default=True)
-parser.add_argument('--init_uncon_steps_per_batch', type=int, default=0)
-parser.add_argument('--simultaneous_uncon_flow', action='store_true', default=True)
-parser.add_argument('--max_steps', type=int, default=20)
+parser.add_argument('--init_uncon_steps_per_batch', type=int, default=1)
+parser.add_argument('--simultaneous_uncon_flow', action='store_true', default=False)
+parser.add_argument('--max_steps', type=int, default=5)
 #parser.add_argument('--step_weights', default='0.05,0.05,0.05,0.05,0.8')
-parser.add_argument('--learning_rate', type=float, default=0.01)
+parser.add_argument('--learning_rate', type=float, default=0.005)
 parser.add_argument('--dataset', default='Countries')
 parser.add_argument('--timer', action='store_true', default=False)
 parser.add_argument('--print_train', action='store_true', default=True)
@@ -1389,7 +1381,7 @@ class Trainer(object):
                 self.model.init_per_batch(heads, rels, tc=tc)
             for step in range(1, self.hparams.max_steps + 1):
                 hidden_uncon, hidden_con, node_attention = \
-                    self.model.flow(hidden_uncon, hidden_con, node_attention, step, tc=tc)
+                    self.model.flow(hidden_uncon, hidden_con, node_attention, tc=tc)
 
             predictions = tf.stack(self.model.node_attention_trace[1:], axis=2)  # batch_size x n_nodes x n_steps
             pred_loss = loss_fn(predictions, tails)
@@ -1443,7 +1435,7 @@ class Evaluator(object):
             self.model.init_per_batch(heads, rels, training=False)
         for step in range(1, self.hparams.max_steps + 1):
             hidden_uncon, hidden_con, node_attention = \
-                self.model.flow(hidden_uncon, hidden_con, node_attention, step, training=False)
+                self.model.flow(hidden_uncon, hidden_con, node_attention, training=False)
         self.model.past_hidden_uncon = hidden_uncon
 
         self.heads.append(heads)
@@ -1546,6 +1538,9 @@ def run(dataset, hparams):
         trainer.reset_metric()
         evaluator.reset_metric()
 
+        if epoch == 90:
+            print(epoch)
+
         n_train = data_env.n_test
         graph_i = 1
         for train_batcher, graph in data_env.draw_train(n_train):
@@ -1562,7 +1557,7 @@ def run(dataset, hparams):
                 train_loss, pred_loss, accuracy = trainer.metric_result()
                 dt = time.time() - t0
 
-                if hparams.print_train and graph_i % 10 == 1 and batch_i % 10 == 1:
+                if hparams.print_train:
                     print('{:d}, {:d}, {:d} | tr_ls: {:.4f} ({:.4f}) | pr_ls: {:.4f} ({:.4f}) | acc: {:.4f} ({:.4f}) |'
                           ' t: {:3f} | {}'.format(epoch, graph_i, batch_i,
                                                   train_loss.numpy(), cur_train_loss,
