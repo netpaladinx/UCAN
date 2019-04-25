@@ -8,7 +8,6 @@ import argparse
 import copy
 
 import numpy as np
-import pandas as pd
 import tensorflow as tf
 from tensorflow.python.keras.api._v2 import keras
 
@@ -23,7 +22,7 @@ VirtualRelations = namedtuple('VirtualRelations',
                                'virtual2vcenter', 'vcenter2virtual', 'vcenter2vcenter'])
 
 class Graph(object):
-    def __init__(self, train_triples, n_ents, n_rels, hparams):
+    def __init__(self, train_triples, n_ents, n_rels, reversed_rel_dct, hparams):
         """ `train_triples`: all (head, tail, rel) in `train`
             `n_ents`: all real nodes in `train` + `valid` + `test`
             `n_rels`: all real relations in `train` + `valid` + `test`
@@ -31,8 +30,9 @@ class Graph(object):
             Virtual nodes should connected to all real nodes in `train` + `valid` + `test`
             via two types of virtual relation: `into_virtual` and `outof_virtual`
         """
-        self.full_train = train_triples
-        self.n_full_train = len(self.full_train)
+        self.train = train_triples
+        self.n_train = len(self.train)
+        self.reversed_rel_dct = reversed_rel_dct
 
         self.virtual_relations = VirtualRelations(n_rels, n_rels + 1, n_rels + 2, n_rels + 3, n_rels + 4, n_rels + 5)
         self.virtual_nodes, self.virtual_edges = self._add_virtual_edges(hparams.n_clusters_per_clustering,
@@ -54,9 +54,6 @@ class Graph(object):
         self.selfloop = self.n_relations
         self.backtrace = self.n_relations + 1
         self.n_aug_relations = self.n_relations + 2  # including 'selfloop' and 'backtrace'
-
-        self.edge2id = self._make_edge2id(self.full_edges)
-        self.count_dct = self._count_over_full_edges(self.full_edges)
 
         # `edges`: remove the current train triples
         # edges[i] = [id, head, tail, rel] sorted by head, tail, rel with ascending but not consecutive `id`s
@@ -117,41 +114,21 @@ class Graph(object):
 
         return virtual_nodes, virtual_edges
 
-    def _count_over_full_edges(self, edges):
-        dct = defaultdict(int)
-        for i, h, t, r in edges:
-            dct[h] += 1
-            dct[(h, r)] += 1
-            dct[(h, r, t)] += 1
-        return dct
-
-    def _make_edge2id(self, edges):
-        dct = defaultdict(set)
-        for i, h, t, r in edges:
-            dct[(h, t, r)].add(i)
-        return dct
-
-    def count(self, t):
-        return self.count_dct[t]
-
-    def draw_train(self, n_train):
-        shuffled_idx = np.random.permutation(self.n_full_train)
-        start = 0
-        while start < self.n_full_train:
-            end = min(start + n_train, self.n_full_train)
-            train = self.full_train[shuffled_idx[start:end]]
-            train_eids = set()
-            for h, t, r in train:
-                train_eids.update(self.edge2id[(h, t, r)])
-            graph_eids = set()
-            for id_set in self.edge2id.values():
-                graph_eids.update(id_set)
-            graph_eids = graph_eids - train_eids
-            graph_eids = np.sort(np.array(list(graph_eids), dtype='int32'))
-            self.edges = self.full_edges[graph_eids]
+    def make_temp_edges(self, batch):
+        """ batch: (np.array) (head, tail, rel)
+        """
+        batch_set = set([(h, t, r) for h, t, r in batch])
+        if self.reversed_rel_dct is None:
+            self.edges = np.array([(eid, h, t, r)
+                                   for eid, h, t, r in self.full_edges
+                                   if (h, t, r) not in batch_set], dtype='int32')
             self.n_edges = len(self.edges)
-            yield train, self
-            start = end
+        else:
+            self.edges = np.array([(eid, h, t, r)
+                                   for eid, h, t, r in self.full_edges
+                                   if (h, t, r) not in batch_set and (t, h, self.reversed_rel_dct[r]) not in batch_set],
+                                  dtype='int32')
+            self.n_edges = len(self.edges)
 
     def use_full_edges(self):
         self.edges = self.full_edges
@@ -444,22 +421,24 @@ class Graph(object):
 
 
 class DataFeeder(object):
-    def get_train_batch(self, train_data, batch_size, shuffle=True):
+    def get_train_batch(self, train_data, graph, batch_size,shuffle=True):
         n_train = len(train_data)
         rand_idx = np.random.permutation(n_train) if shuffle else np.arange(n_train)
         start = 0
         while start < n_train:
             end = min(start + batch_size, n_train)
-            batch = [train_data[i] for i in rand_idx[start:end]]
-            yield np.array(batch, dtype='int32'), end - start
+            batch = np.array([train_data[i] for i in rand_idx[start:end]], dtype='int32')
+            graph.make_temp_edges(batch)
+            yield batch, end - start
             start = end
 
-    def get_eval_batch(self, eval_data, batch_size):
+    def get_eval_batch(self, eval_data, graph, batch_size):
         n_eval = len(eval_data)
         start = 0
         while start < n_eval:
             end = min(start + batch_size, n_eval)
             batch = eval_data[start:end]
+            graph.use_full_edges()
             yield np.array(batch, dtype='int32'), end - start
             start = end
 
@@ -469,34 +448,30 @@ class DataEnv(object):
         self.hparams = hparams
         self.data_feeder = DataFeeder()
 
-        self.valid_triples = dataset.valid
-        self.test_triples = dataset.test
-        self.n_valid = len(self.valid_triples)
-        self.n_test = len(self.test_triples)
+        self.valid = dataset.valid
+        self.test = dataset.test
+        self.n_valid = len(self.valid)
+        self.n_test = len(self.test)
 
         # `graph`:
-        # (1) graph.entities: train + valid + test + { n virtual nodes }
-        # (2) graph.relations: train + valid + test + { 'into_virtual', 'outof_virtual' }
+        # (1) graph.entities: train + valid + test + virtual nodes
+        # (2) graph.relations: train + valid + test + virtual relations
         # (3) graph.full_edges: train + virtual edges
         # (4) graph.edges: train - split_train + virtual edges
-        self.graph = Graph(dataset.train, dataset.n_entities, dataset.n_relations, hparams)
+        self.graph = Graph(dataset.train, dataset.n_entities, dataset.n_relations, dataset.reversed_rel_dct, hparams)
 
         self.filter_pool = defaultdict(set)
-        for head, tail, rel in np.concatenate([self.graph.full_train, self.valid_triples, self.test_triples], axis=0):
+        for head, tail, rel in np.concatenate([self.graph.train, self.valid, self.test], axis=0):
             self.filter_pool[(head, rel)].add(tail)
 
-    def draw_train(self, n_train):
-        for train, graph in self.graph.draw_train(n_train):
-            yield self.get_train_batcher(train), graph
-
-    def get_train_batcher(self, train):
-        return partial(self.data_feeder.get_train_batch, train, shuffle=False)
+    def get_train_batcher(self):
+        return partial(self.data_feeder.get_train_batch, self.graph.train, self.graph, shuffle=False)
 
     def get_valid_batcher(self):
-        return partial(self.data_feeder.get_eval_batch, self.valid_triples)
+        return partial(self.data_feeder.get_eval_batch, self.valid, self.graph)
 
     def get_test_batcher(self):
-        return partial(self.data_feeder.get_eval_batch, self.test_triples)
+        return partial(self.data_feeder.get_eval_batch, self.test, self.graph)
 
 
 """ model.py """
@@ -1152,7 +1127,7 @@ class Model(object):
         # node_attention: batch_size x n_nodes
         return hidden_uncon, hidden_con, node_attention
 
-    def flow(self, hidden_uncon, hidden_con, node_attention, training=True, tc=None):
+    def flow(self, hidden_uncon, hidden_con, node_attention, tc=None):
         """ hidden_uncon: 1 x n_nodes x n_dims_lg
             hidden_con: n_memorized_nodes x n_dims
             node_attention: batch_size x n_nodes
@@ -1293,12 +1268,11 @@ class Model(object):
 
 parser = argparse.ArgumentParser()
 
-"""
 # FB237
 parser.add_argument('-bs', '--batch_size', type=int, default=100)
-parser.add_argument('--n_dims_sm', type=int, default=10)
+parser.add_argument('--n_dims_sm', type=int, default=50)
 parser.add_argument('--n_dims', type=int, default=100)
-parser.add_argument('--n_dims_lg', type=int, default=500)
+parser.add_argument('--n_dims_lg', type=int, default=1000)
 parser.add_argument('--ent_emb_l2', type=float, default=0.)
 parser.add_argument('--rel_emb_l2', type=float, default=0.)
 parser.add_argument('--max_edges_per_example', type=int, default=10000)
@@ -1314,57 +1288,24 @@ parser.add_argument('--connected_clustering', action='store_true', default=False
 parser.add_argument('--init_uncon_steps_per_batch', type=int, default=1)
 parser.add_argument('--simultaneous_uncon_flow', action='store_true', default=False)
 parser.add_argument('--max_steps', type=int, default=5)
-#parser.add_argument('--step_weights', default='0.05,0.05,0.05,0.05,0.8')
 parser.add_argument('--learning_rate', type=float, default=0.005)
 parser.add_argument('--dataset', default='FB237')
 parser.add_argument('--timer', action='store_true', default=False)
 parser.add_argument('--print_train', action='store_true', default=True)
-"""
-
-
-# Countries
-parser.add_argument('-bs', '--batch_size', type=int, default=50)
-parser.add_argument('--n_dims_sm', type=int, default=10)
-parser.add_argument('--n_dims', type=int, default=20)
-parser.add_argument('--n_dims_lg', type=int, default=30)
-parser.add_argument('--ent_emb_l2', type=float, default=0.01)
-parser.add_argument('--rel_emb_l2', type=float, default=0.01)
-parser.add_argument('--max_edges_per_example', type=int, default=100)
-parser.add_argument('--max_attended_nodes', type=int, default=5)
-parser.add_argument('--max_edges_per_node', type=int, default=20)
-parser.add_argument('--max_backtrace_nodes', type=int, default=10)
-parser.add_argument('--backtrace_decay', type=float, default=1.)
-parser.add_argument('--max_seen_nodes', type=int, default=10)
-parser.add_argument('--max_epochs', type=int, default=100)
-parser.add_argument('--n_clustering', type=int, default=0)
-parser.add_argument('--n_clusters_per_clustering', type=int, default=0)
-parser.add_argument('--connected_clustering', action='store_true', default=True)
-parser.add_argument('--init_uncon_steps_per_batch', type=int, default=1)
-parser.add_argument('--simultaneous_uncon_flow', action='store_true', default=False)
-parser.add_argument('--max_steps', type=int, default=5)
-#parser.add_argument('--step_weights', default='0.05,0.05,0.05,0.05,0.8')
-parser.add_argument('--learning_rate', type=float, default=0.005)
-parser.add_argument('--dataset', default='Countries')
-parser.add_argument('--timer', action='store_true', default=False)
-parser.add_argument('--print_train', action='store_true', default=True)
-parser.add_argument('--print_eval', action='store_true', default=False)
-
+parser.add_argument('--print_train_freq', type=int, default=1)
+parser.add_argument('--print_eval', action='store_true', default=True)
+parser.add_argument('--print_eval_freq', type=int, default=100)
+parser.add_argument('--moving_mean_decay', type=float, default=0.99)
 
 default_hparams = parser.parse_args()
 
 
 def loss_fn(predictions, tails):
-    """ predictions: (tf.Tensor) batch_size x n_nodes x n_steps
+    """ predictions: (tf.Tensor) batch_size x n_nodes
         tails: (np.array) batch_size
     """
-    # step_weights = list(map(lambda x: float(x), self.hparams.step_weights.split(',')))  # n_steps
-    # pred_idx = tf.stack([tf.range(0, len(tails)), tails], axis=1)  # batch_size x 2
-    # pred_prob = tf.gather_nd(predictions, pred_idx)  # batch_size x n_steps
-    # pred_loss = tf.reduce_mean(tf.reduce_sum(- tf.math.log(pred_prob + 1e-20) * step_weights, axis=1))
-
     pred_idx = tf.stack([tf.range(0, len(tails)), tails], axis=1)  # batch_size x 2
-    pred_prob = tf.gather_nd(predictions[:, :, -1], pred_idx) if tf.rank(predictions) == 3 \
-        else tf.gather_nd(predictions, pred_idx)  # batch_size
+    pred_prob = tf.gather_nd(predictions, pred_idx)  # batch_size
     pred_loss = tf.reduce_mean(- tf.math.log(pred_prob + 1e-20))
     return pred_loss
 
@@ -1375,20 +1316,17 @@ class Trainer(object):
         self.hparams = hparams
         self.optimizer = keras.optimizers.Adam(learning_rate=hparams.learning_rate)
 
-        self.train_loss = keras.metrics.Mean(name='train_loss')
-        self.train_pred_loss = keras.metrics.Mean(name='train_pred_loss')
-        self.train_accuracy = keras.metrics.SparseCategoricalAccuracy(name='train_accuracy')
+        self.train_loss = None
+        self.train_accuracy = None
 
     def train_step(self, heads, tails, rels, tc=None):
         with tf.GradientTape() as tape:
-            hidden_uncon, hidden_con, node_attention = \
-                self.model.init_per_batch(heads, rels, tc=tc)
+            hidden_uncon, hidden_con, node_attention = self.model.initialize(heads, rels, tc=tc)
             for step in range(1, self.hparams.max_steps + 1):
-                hidden_uncon, hidden_con, node_attention = \
-                    self.model.flow(hidden_uncon, hidden_con, node_attention, tc=tc)
+                hidden_uncon, hidden_con, node_attention = self.model.flow(hidden_uncon, hidden_con, node_attention, tc=tc)
 
-            predictions = tf.stack(self.model.node_attention_trace[1:], axis=2)  # batch_size x n_nodes x n_steps
-            pred_loss = loss_fn(predictions, tails)
+            prediction = node_attention  # batch_size x n_nodes
+            pred_loss = loss_fn(prediction, tails)
             reg_loss = self.model.regularization_loss
             loss = pred_loss + reg_loss
 
@@ -1404,19 +1342,12 @@ class Trainer(object):
         if tc is not None:
             tc['grad']['apply'] += time.time() - t0
 
-        final_prediction = predictions[:, :, -1]
-        self.train_loss(loss)
-        self.train_pred_loss(pred_loss)
-        self.train_accuracy(tails, final_prediction)
+        decay = self.hparams.moving_mean_decay
+        self.train_loss = loss if self.train_loss is None else self.train_loss * decay + loss * (1 - decay)
+        accuracy = tf.reduce_mean(tf.cast(tf.equal(tf.argmax(prediction, axis=1), tails), tf.float32))
+        self.train_accuracy = accuracy if self.train_accuracy is None else self.train_accuracy * decay + accuracy * (1 - decay)
 
-        accuracy = tf.reduce_mean(tf.cast(tf.equal(tf.argmax(final_prediction, axis=1), tails), tf.float32))
-        return loss, pred_loss, accuracy
-
-    def reset_metric(self):
-        self.train_accuracy.reset_states()
-
-    def metric_result(self):
-        return self.train_loss.result(), self.train_pred_loss.result(), self.train_accuracy.result()
+        return loss.numpy(), accuracy.numpy(), self.train_loss.numpy(), self.train_accuracy.numpy()
 
 
 class Evaluator(object):
@@ -1430,46 +1361,38 @@ class Evaluator(object):
         self.predictions = []
         self.targets = []
 
-        self.eval_loss = keras.metrics.Mean(name='eval_loss')
-        self.eval_pred_loss = keras.metrics.Mean(name='eval_pred_loss')
-        self.eval_accuracy = keras.metrics.SparseCategoricalAccuracy(name='eval_accuracy')
+        self.eval_loss = None
+        self.eval_accuracy = None
 
     def eval_step(self, heads, tails, rels):
-        hidden_uncon, hidden_con, node_attention = \
-            self.model.init_per_batch(heads, rels, training=False)
+        hidden_uncon, hidden_con, node_attention = self.model.initialize(heads, rels)
         for step in range(1, self.hparams.max_steps + 1):
-            hidden_uncon, hidden_con, node_attention = \
-                self.model.flow(hidden_uncon, hidden_con, node_attention, training=False)
-        self.model.past_hidden_uncon = hidden_uncon
+            hidden_uncon, hidden_con, node_attention = self.model.flow(hidden_uncon, hidden_con, node_attention)
 
         self.heads.append(heads)
         self.relations.append(rels)
         self.predictions.append(node_attention.numpy())
         self.targets.append(tails)
 
-        predictions = node_attention
-        pred_loss = loss_fn(predictions, tails)
+        prediction = node_attention
+        pred_loss = loss_fn(prediction, tails)
         reg_loss = self.model.regularization_loss
         loss = pred_loss + reg_loss
 
-        self.eval_loss(loss)
-        self.eval_pred_loss(pred_loss)
-        self.eval_accuracy(tails, predictions)
+        decay = self.hparams.moving_mean_decay
+        self.eval_loss = loss if self.eval_loss is None else self.eval_loss * decay + loss * (1 - decay)
+        accuracy = tf.reduce_mean(tf.cast(tf.equal(tf.argmax(prediction, axis=1), tails), tf.float32))
+        self.eval_accuracy = accuracy if self.eval_accuracy is None else self.eval_accuracy * decay + accuracy * (1 - decay)
 
-        accuracy = tf.reduce_mean(tf.cast(tf.equal(tf.argmax(predictions, axis=1), tails), tf.float32))
-        return loss, pred_loss, accuracy
+        return loss.numpy(), accuracy.numpy(), self.eval_loss.numpy(), self.eval_accuracy.numpy()
 
     def reset_metric(self):
         self.heads = []
         self.relations = []
         self.predictions = []
         self.targets = []
-        self.eval_accuracy.reset_states()
 
     def metric_result(self):
-        return self.eval_loss.result(), self.eval_pred_loss.result(), self.eval_accuracy.result()
-
-    def final_metric_result(self):
         heads = np.concatenate(self.heads, axis=0)
         relations = np.concatenate(self.relations, axis=0)
         predictions = np.concatenate(self.predictions, axis=0)
@@ -1538,42 +1461,44 @@ def run(dataset, hparams):
     trainer = Trainer(model, hparams)
     evaluator = Evaluator(model, data_env, hparams)
 
+    train_batcher = data_env.get_train_batcher()
+    valid_batcher = data_env.get_valid_batcher()
+    test_batcher = data_env.get_test_batcher()
+
     for epoch in range(1, hparams.max_epochs + 1):
-        trainer.reset_metric()
+        batch_i = 1
+
+        valid_batch_gen = valid_batcher(hparams.batch_size)
+        test_batch_gen = test_batcher(hparams.batch_size)
+        for train_batch, batch_size in train_batcher(hparams.batch_size):
+            t0 = time.time()
+            time_cost = reset_time_cost(hparams)
+            heads, tails, rels = np.split(train_batch, 3, axis=1)
+            cur_train_loss, cur_accuracy, train_loss, accuracy = trainer.train_step(heads, tails, rels, tc=time_cost)
+            dt = time.time() - t0
+
+            if hparams.print_train and batch_i % hparams.print_train_freq == 0:
+                print('[TRAIN] {:d}, {:d} | tr_ls: {:.4f} ({:.4f})| acc: {:.4f} ({:.4f}) |'
+                      ' t: {:.4f} | {}'.format(epoch, batch_i,
+                                               train_loss, cur_train_loss, accuracy, cur_accuracy,
+                                               dt, str_time_cost(time_cost)))
+
+            if hparams.print_eval and batch_i % hparams.print_eval_freq == 0:
+                try:
+                    valid_batch, batch_size = next(valid_batch_gen)
+                    t0 = time.time()
+                    heads, tails, rels = np.
+                except StopIteration:
+                    valid_batch_gen = valid_batcher(hparams.batch_size)
+
+                try:
+                    test_batch, batch_size = next(test_batch_gen)
+                except StopIteration:
+                    test_batch_gen = test_batcher(hparams.batch_size)
+
+            batch_i += 1
+
         evaluator.reset_metric()
-
-        if epoch == 90:
-            print(epoch)
-
-        n_train = data_env.n_test
-        graph_i = 1
-        for train_batcher, graph in data_env.draw_train(n_train):
-
-            batch_i = 1
-            for train_batch, batch_size in train_batcher(hparams.batch_size):
-                t0 = time.time()
-                time_cost = reset_time_cost(hparams)
-
-                heads, tails, rels = train_batch[:, 0], train_batch[:, 1], train_batch[:, 2]
-                cur_train_loss, cur_pred_loss, cur_accuracy = trainer.train_step(heads, tails, rels,
-                                                                                 tc=time_cost)
-
-                train_loss, pred_loss, accuracy = trainer.metric_result()
-                dt = time.time() - t0
-
-                if hparams.print_train:
-                    print('{:d}, {:d}, {:d} | tr_ls: {:.4f} ({:.4f}) | pr_ls: {:.4f} ({:.4f}) | acc: {:.4f} ({:.4f}) |'
-                          ' t: {:3f} | {}'.format(epoch, graph_i, batch_i,
-                                                  train_loss.numpy(), cur_train_loss,
-                                                  pred_loss.numpy(), cur_pred_loss,
-                                                  accuracy.numpy(), cur_accuracy,
-                                                  dt,
-                                                  str_time_cost(time_cost)))
-                batch_i += 1
-
-            graph_i += 1
-
-        data_env.graph.use_full_edges()
         valid_batcher = data_env.get_valid_batcher()
         batch_i = 1
         for valid_batch, batch_size in valid_batcher(hparams.batch_size):

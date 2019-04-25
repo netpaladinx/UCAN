@@ -19,6 +19,7 @@ class Dataset(object):
         if split_ratio is not None:
             train, valid, test = self._split_into_train_valid_test(train + valid + test, split_ratio, shuffle=True)
 
+        self.reversed_rel_dct = None
         if include_reverse:
             train = self._add_reverse_triples(train)
             valid = self._add_reverse_triples(valid)
@@ -27,6 +28,7 @@ class Dataset(object):
             self.entity2id, self.id2entity, self.relation2id, self.id2relation = self._make_dict(train + valid + test)
             self.n_entities = len(self.entity2id)
             self.n_relations = len(self.relation2id)
+            self.reversed_rel_dct = self._get_reversed_relation_dict(self.relation2id)
 
         self.train = self._convert_to_id(train)
         self.valid = self._convert_to_id(valid)
@@ -68,6 +70,9 @@ class Dataset(object):
 
     def _add_reverse_triples(self, triples):
         return triples + [(t, h, '_' + r) for h, t, r in triples]
+
+    def _get_reversed_relation_dict(self, relation2id):
+        return {id: relation2id['_' + rel if rel[0] != '_' else rel[1:]] for rel, id in relation2id.items()}
 
     def _convert_to_id(self, triples):
         return np.array([(self.entity2id[h], self.entity2id[t], self.relation2id[r])
