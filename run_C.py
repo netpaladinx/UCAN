@@ -513,7 +513,7 @@ class F(keras.layers.Layer):
 
     def build(self, input_shape):
         n_ws = len(self.interact)
-        self.ws = self.add_weight(shape=(n_ws, self.n_dims), initializer=keras.initializers.ones(), name='ws')
+        self.ws = self.add_weight(shape=(n_ws, self.n_dims), initializer=keras.initializers.VarianceScaling(), name='ws')
         if self.use_bias:
             self.b = self.add_weight(shape=(self.n_dims,), initializer=keras.initializers.zeros(), name='b')
         if self.output_weight:
@@ -528,7 +528,7 @@ class F(keras.layers.Layer):
         for idxs in self.interact:
             x = 1.
             for idx in idxs:
-                x = x * tf.maximum(inputs[idx], 0)
+                x = x * inputs[idx]
             xs.append(x)  # x: bs x ... x n_dims
         xs = tf.stack(xs, axis=-2)  # bs x ... x n_ws x n_dims
         outputs = tf.reduce_sum(xs * self.ws, axis=-2)  # bs x ... x n_dims
@@ -952,23 +952,6 @@ class ConsciousnessFlow(keras.Model):
             tc['c.call'] += time.time() - t0
         return hidden  # n_memorized_nodes x n_dims
 
-    def get_query_context(self, heads, rels, tc=None):
-        """ heads: batch_size
-            rels: batch_size
-        """
-        if tc is not None:
-            t0 = time.time()
-
-        with tf.name_scope(self.name):
-            head_emb = self.entity_embedding(heads)  # batch_size x n_dims
-            rel_emb = self.relation_embedding(rels)  # batch_size x n_dims
-            query_context = self.f_query((head_emb, rel_emb))
-            query_context = self.g_query(query_context)
-
-        if tc is not None:
-            tc['c.query'] += time.time() - t0
-        return query_context  # batch_size x n_dims
-
     def get_init_hidden(self, query_context, hidden_uncon, memorized_v, tc=None):
         """ query_context: batch_size x n_dims
             hidden_uncon: 1 x n_nodes x n_dims_lg
@@ -1003,9 +986,8 @@ class AttentionFlow(keras.Model):
                                                          embeddings_regularizer=keras.regularizers.l2(rel_emb_l2),
                                                          name='relations')
         # f(hidden_con_vi, hidden_uncon_vi, rel_emb, hidden_con_vj, hidden_uncon_vj)
-        #self.f_transition = F([[0, 3], [0, 2, 3], [0, 4], [0, 2, 4], [1, 3], [1, 2, 3], [1, 4], [1, 2, 4]], self.n_dims,
-        #                      activation=None, name='f_trans')
-        self.f_transition = F([[0, 3], [0, 2, 3], [0, 4], [0, 2, 4],], self.n_dims, activation=None, name='f_trans')
+        self.f_transition = F([[0, 3], [0, 2, 3], [0, 4], [0, 2, 4], [1, 3], [1, 2, 3], [1, 4], [1, 2, 4]], self.n_dims,
+                              activation=tf.nn.relu, output_weight=True, output_bias=True, name='f_trans')
         self.proj_con = keras.layers.Dense(self.n_dims, activation=tf.tanh, name='proj_con')
         self.proj_uncon = keras.layers.Dense(self.n_dims, activation=tf.tanh, name='proj_uncon')
 
@@ -1051,7 +1033,7 @@ class AttentionFlow(keras.Model):
         rel_emb = self.relation_embedding(rel_idx)  # n_aug_scanned_edges x n_dims_sm
 
         transition_logits = self.f_transition((hidden_con_vi, hidden_uncon_vi, rel_emb, hidden_con_vj, hidden_uncon_vj))  # n_aug_scanned_edges x n_dims_sm
-        transition_logits = tf.tanh(tf.reduce_sum(transition_logits, axis=1))  # n_aug_scanned_edges
+        transition_logits = tf.reduce_sum(transition_logits, axis=1)  # n_aug_scanned_edges
 
         transition = self.neighbor_softmax(transition_logits, selected_edges=scanned_edges)  # n_aug_scanned_edges
 
@@ -1087,6 +1069,10 @@ class AttentionFlow(keras.Model):
         return node_attention
 
 
+class SharedEmbedding(keras.Model):
+    def __init__(self, n_):
+
+
 class Model(object):
     def __init__(self, graph, hparams):
         self.graph = graph
@@ -1101,7 +1087,24 @@ class Model(object):
                                       hparams.rel_emb_l2)
         self.node_attention_trace = None
 
-    def init_per_batch(self, heads, rels, training=True, tc=None):
+    def get_query_context(self, heads, rels, tc=None):
+        """ heads: batch_size
+            rels: batch_size
+        """
+        if tc is not None:
+            t0 = time.time()
+
+        with tf.name_scope(self.name):
+            head_emb = self.entity_embedding(heads)  # batch_size x n_dims
+            rel_emb = self.relation_embedding(rels)  # batch_size x n_dims
+            query_context = self.f_query((head_emb, rel_emb))
+            query_context = self.g_query(query_context)
+
+        if tc is not None:
+            tc['c.query'] += time.time() - t0
+        return query_context  # batch_size x n_dims
+
+    def initialize(self, heads, rels, training=True, tc=None):
         """ heads: batch_size
             rels: batch_size
         """
@@ -1332,11 +1335,11 @@ parser.add_argument('--max_edges_per_node', type=int, default=20)
 parser.add_argument('--max_backtrace_nodes', type=int, default=10)
 parser.add_argument('--backtrace_decay', type=float, default=1.)
 parser.add_argument('--max_seen_nodes', type=int, default=10)
-parser.add_argument('--max_epochs', type=int, default=20)
+parser.add_argument('--max_epochs', type=int, default=100)
 parser.add_argument('--n_clustering', type=int, default=0)
 parser.add_argument('--n_clusters_per_clustering', type=int, default=0)
 parser.add_argument('--connected_clustering', action='store_true', default=True)
-parser.add_argument('--init_uncon_steps_per_batch', type=int, default=3)
+parser.add_argument('--init_uncon_steps_per_batch', type=int, default=1)
 parser.add_argument('--simultaneous_uncon_flow', action='store_true', default=False)
 parser.add_argument('--max_steps', type=int, default=5)
 #parser.add_argument('--step_weights', default='0.05,0.05,0.05,0.05,0.8')
@@ -1539,7 +1542,7 @@ def run(dataset, hparams):
         trainer.reset_metric()
         evaluator.reset_metric()
 
-        if epoch == 15:
+        if epoch == 90:
             print(epoch)
 
         n_train = data_env.n_test
