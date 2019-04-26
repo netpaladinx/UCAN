@@ -53,7 +53,7 @@ class Graph(object):
 
         self.selfloop = self.n_relations
         self.backtrace = self.n_relations + 1
-        self.n_aug_relations = self.n_relations + 2  # including 'selfloop' and 'backtrace'
+        self.n_relations = self.n_relations + 2  # including 'selfloop' and 'backtrace'
 
         # `edges`: remove the current train triples
         # edges[i] = [id, head, tail, rel] sorted by head, tail, rel with ascending but not consecutive `id`s
@@ -476,202 +476,522 @@ class DataEnv(object):
 
 """ model.py """
 
+def normalize_op(inputs, mode, mix_factor=None):
+    if mode == 'tanh':
+        return tf.tanh(inputs)
+    elif mode == 'linear':
+        return tf.maximum(inputs, 0) / tf.stop_gradient(tf.maximum(1, tf.reduce_max(inputs, axis=-1, keepdims=True))) \
+               - tf.minimum(inputs, 0) / tf.stop_gradient(tf.minimum(-1, tf.reduce_min(inputs, axis=-1, keepdims=True)))
+    elif mode == 'mix':
+        mix_factor = 0.5 if mix_factor is None else mix_factor
+        return tf.tanh(inputs) * mix_factor \
+               + (tf.maximum(inputs, 0) / tf.stop_gradient(tf.maximum(1, tf.reduce_max(inputs, axis=-1, keepdims=True)))
+                  - tf.minimum(inputs, 0) / tf.stop_gradient(tf.minimum(-1, tf.reduce_min(inputs, axis=-1, keepdims=True)))) \
+               * (1 - mix_factor)
+    else:
+        raise ValueError('Invalid `mode`')
+
+
 class F(keras.layers.Layer):
-    def __init__(self, interact, n_dims, use_bias=True, activation=None, output_weight=False, output_bias=False, name=None):
+    def __init__(self, interact, n_dims, use_bias=True, name=None):
         super(F, self).__init__(name=name)
         self.interact = interact
         self.n_dims = n_dims
         self.use_bias = use_bias
-        self.activation = activation
-        self.output_weight = output_weight
-        self.output_bias = output_bias
 
     def build(self, input_shape):
-        n_ws = len(self.interact)
-        self.ws = self.add_weight(shape=(n_ws, self.n_dims), initializer=keras.initializers.VarianceScaling(), name='ws')
+        n_prod = len(self.interact)
+        self.pos_weight = self.add_weight(shape=(n_prod, self.n_dims),
+                                          initializer=keras.initializers.constant(
+                                              np.ones((n_prod, self.n_dims), dtype='float32') / n_prod),
+                                          name='pos_weight')
+        self.neg_weight = self.add_weight(shape=(n_prod, self.n_dims),
+                                          initializer=keras.initializers.constant(
+                                              np.ones((n_prod, self.n_dims), dtype='float32') / n_prod),
+                                          name='neg_weight')
         if self.use_bias:
-            self.b = self.add_weight(shape=(self.n_dims,), initializer=keras.initializers.zeros(), name='b')
-        if self.output_weight:
-            self.out_w = self.add_weight(shape=(self.n_dims,), initializer=keras.initializers.VarianceScaling(), name='out_w')
-        if self.output_bias:
-            self.out_b = self.add_weight(shape=(self.n_dims,), initializer=keras.initializers.zeros(), name='out_b')
+            self.bias = self.add_weight(shape=(self.n_dims,), initializer=keras.initializers.zeros(),
+                                        name='bias')
 
-    def call(self, inputs, training=None):
+    def call(self, inputs, condition=None, norm_mode=None, norm_mix=None, training=None):
         """ inputs[i]: bs x ... x n_dims
+            condition: bs x ... x n_dims
         """
-        xs = []
+        pos_xs, neg_xs = [], []
         for idxs in self.interact:
-            x = 1.
+            pos_x, neg_x = (1., 1.) if condition is None else (tf.maximum(condition, 0), - tf.minimum(condition, 0))
             for idx in idxs:
-                x = x * inputs[idx]
-            xs.append(x)  # x: bs x ... x n_dims
-        xs = tf.stack(xs, axis=-2)  # bs x ... x n_ws x n_dims
-        outputs = tf.reduce_sum(xs * self.ws, axis=-2)  # bs x ... x n_dims
+                pos_x = pos_x * tf.maximum(inputs[idx], 0)
+                neg_x = neg_x * (- tf.minimum(inputs[idx], 0))
+            pos_xs.append(pos_x)  # pos_x: bs x ... x n_dims
+            neg_xs.append(neg_x)  # neg_x: bs x ... x n_dims
+        pos_xs = tf.stack(pos_xs, axis=-2)  # bs x ... x n_prod x n_dims
+        neg_xs = tf.stack(neg_xs, axis=-2)  # bs x ... x n_prod x n_dims
+        pos_out = tf.reduce_sum(pos_xs * self.pos_weight, axis=-2)  # bs x ... x n_dims
+        neg_out = tf.reduce_sum(neg_xs * self.neg_weight, axis=-2)  # bs x ... x n_dims
+        out = pos_out - neg_out
         if self.use_bias:
-            outputs = outputs + self.b
-        if self.activation:
-            outputs = self.activation(outputs)
-        if self.output_weight:
-            outputs = outputs * self.out_w
-        if self.output_bias:
-            outputs = outputs + self.out_b
-        return outputs
+            out = out + self.bias
+        out = normalize_op(out, norm_mode, mix_factor=norm_mix)
+        return out
 
 
 class G(keras.layers.Layer):
-    def __init__(self, n_dims, use_bias=True, activation=None, output_weight=False, output_bias=False, residual=True, name=None):
+    def __init__(self, n_dims, use_bias=True, use_gate=True, name=None):
         super(G, self).__init__(name=name)
         self.n_dims = n_dims
         self.use_bias = use_bias
-        self.activation = activation
-        self.output_bias = output_bias
-        self.output_weight = output_weight
-        self.residual = residual
+        self.use_gate = use_gate
 
     def build(self, input_shape):
-        self.dense = keras.layers.Dense(self.n_dims, activation=self.activation, use_bias=self.use_bias, name='den')
-        if self.output_weight:
-            self.dense_out = keras.layers.Dense(self.n_dims, use_bias=self.output_bias, name='out')
+        self.proj = keras.layers.Dense(self.n_dims, activation=tf.tanh, use_bias=self.use_bias, name='proj')
+        if self.use_gate:
+            self.gate = keras.layers.Dense(self.n_dims, activation=tf.sigmoid, use_bias=self.use_bias, name='gate')
 
-    def call(self, inputs, training=None):
-        outputs = self.dense(inputs)
-        if self.output_weight:
-            outputs = self.dense_out(outputs)
-        if self.residual:
-            outputs = inputs + outputs
-        return outputs
+    def call(self, inputs, norm_mode=None, norm_mix=None, training=None):
+        update = self.proj(inputs)
+        if self.use_gate:
+            update = self.gate(inputs) * update
+        out = inputs + update
+        out = normalize_op(out, norm_mode, mix_factor=norm_mix)
+        return out
 
 
-class ReducedGRU(keras.layers.Layer):
-    def __init__(self, n_dims, name=None):
-        super(ReducedGRU, self).__init__(n_dims, name=name)
+class Composite1(keras.layers.Layer):
+    """ f -> g (no gate)
+    """
+    def __init__(self, interact, n_dims, name=None):
+        super(Composite1, self).__init__(name=name)
+        self.interact = interact
         self.n_dims = n_dims
 
     def build(self, input_shape):
-        self.z_gate = keras.layers.Dense(self.n_dims, activation=tf.math.sigmoid, name='z_gate')
+        self.f = F(self.interact, self.n_dims, name='f')
+        self.g_ng = G(self.n_dims, use_gate=False, name='g_ng')
 
-    def call(self, inputs, training=None):
-        prev_hidden, update = inputs
-        z = self.z_gate(tf.concat([prev_hidden, update], -1))
-        new_hidden = (1 - z) * prev_hidden + z * update
-        return new_hidden
-
-
-class Node2Edge(keras.layers.Layer):
-    def call(self, inputs, selected_edges=None, return_vi=True, return_vj=True, training=None):
-        """ inputs (hidden): batch_size x n_nodes x n_dims
-            selected_edges: n_selected_edges x 6 (or 8) ( int32, selected_edges[i] = (idx, vi, vj, rel, idx_vi, idx_vj), sorted by idx, vi, vj )
+    def call(self, inputs, **kwargs):
+        """ kwargs: norm_mode, norm_mix
         """
-        assert selected_edges is not None
-        hidden = inputs
-        batch_size = tf.shape(inputs)[0]
-        n_selected_edges = len(selected_edges)
-        idx = tf.cond(tf.equal(batch_size, 1), lambda: tf.zeros((n_selected_edges,), dtype='int32'), lambda: selected_edges[:, 0])
-        result = []
-        if return_vi:
-            idx_and_vi = tf.stack([idx, selected_edges[:, 1]], axis=1)  # n_selected_edges x 2
-            hidden_vi = tf.gather_nd(hidden, idx_and_vi)  # n_selected_edges x n_dims
-            result.append(hidden_vi)
-        if return_vj:
-            idx_and_vj = tf.stack([idx, selected_edges[:, 2]], axis=1)  # n_selected_edges x 2
-            hidden_vj = tf.gather_nd(hidden, idx_and_vj)  # n_selected_edges x n_dims
-            result.append(hidden_vj)
-        return result
+        out = self.f(inputs, **kwargs)
+        out = self.g_ng(out, **kwargs)
+        return out
 
 
-class Node2Edge_v2(keras.layers.Layer):
-    def call(self, inputs, selected_edges=None, return_vi=True, return_vj=True, training=None):
-        """ inputs (hidden): n_selected_nodes x n_dims
-            selected_edges: n_selected_edges x 8 ( int32, selected_edges[i] = (idx, vi, vj, rel, idx_vi, idx_vj, new_idx_e2vi, new_idx_e2vj), sorted by idx, vi, vj )
+class Composite2(keras.layers.Layer):
+    """ f -> g (with gate)
+    """
+    def __init__(self, interact, n_dims, name=None):
+        super(Composite2, self).__init__(name=name)
+        self.interact = interact
+        self.n_dims = n_dims
+
+    def build(self, input_shape):
+        self.f = F(self.interact, self.n_dims, name='f')
+        self.g_wg = G(self.n_dims, use_gate=True, name='g_wg')
+
+    def call(self, inputs, **kwargs):
+        """ kwargs: norm_mode, norm_mix
         """
-        assert selected_edges is not None
-        assert return_vi or return_vj
-        hidden = inputs
-        result = []
-        if return_vi:
-            new_idx_e2vi = selected_edges[:, 6]  # n_selected_edges
-            hidden_vi = tf.gather(hidden, new_idx_e2vi)  # n_selected_edges x n_dims
-            result.append(hidden_vi)
-        if return_vj:
-            new_idx_e2vj = selected_edges[:, 7]  # n_selected_edges
-            hidden_vj = tf.gather(hidden, new_idx_e2vj)  # n_selected_edges x n_dims
-            result.append(hidden_vj)
-        return result
+        out = self.f(inputs, **kwargs)
+        out = self.g_wg(out, **kwargs)
+        return out
 
 
-class Aggregate(keras.layers.Layer):
-    def call(self, inputs, selected_edges=None, output_shape=None, at='vj', aggr_op='mean', training=None):
-        """ inputs (edge_vec): n_seleted_edges x ...
-            selected_edges: n_selected_edges x 6 ( int32, selected_edges[i] = (idx, vi, vj, rel, idx_vi, idx_vj), sorted by idx, vi, vj )
-            output_shape: (batch_size=1, n_nodes, ...)
+class Composite3(keras.layers.Layer):
+    """ f -> f (cond)
+    """
+    def __init__(self, interact, n_dims, name=None):
+        super(Composite3, self).__init__(name=name)
+        self.interact = interact
+        self.n_dims = n_dims
+
+    def build(self, input_shape):
+        self.f = F(self.interact, self.n_dims, name='f')
+        self.f_cond = F(self.interact, self.n_dims, name='f_cond')
+
+    def call(self, inputs, **kwargs):
+        """ kwargs: norm_mode, norm_mix
         """
-        assert selected_edges is not None
-        assert output_shape is not None
-        edge_vec = inputs
-        if at == 'vi':
-            idx_vi = selected_edges[:, 4]  # n_selected_edges
-            aggr_op = tf.math.segment_mean if aggr_op == 'mean' else \
-                tf.math.segment_sum if aggr_op == 'sum' else \
-                tf.math.segment_max if aggr_op == 'max' else None
-            edge_vec_aggr = aggr_op(edge_vec, idx_vi)  # (max_idx_vi+1) x ...
-            idx_and_vi = tf.stack([selected_edges[:, 0], selected_edges[:, 1]], axis=1)  # n_selected_edges x 2
-            idx_and_vi = tf.cast(tf.math.segment_max(idx_and_vi, idx_vi), tf.int32)  # (max_id_vi+1) x 2
-            edge_vec_aggr = tf.scatter_nd(idx_and_vi, edge_vec_aggr, output_shape)  # batch_size x n_nodes x ...
-        elif at == 'vj':
-            idx_vj = selected_edges[:, 5]  # n_selected_edges
-            max_idx_vj = tf.reduce_max(idx_vj)
-            aggr_op = tf.math.unsorted_segment_mean if aggr_op == 'mean' else \
-                tf.math.unsorted_segment_sum if aggr_op == 'sum' else \
-                tf.math.unsorted_segment_max if aggr_op == 'max' else None
-            edge_vec_aggr = aggr_op(edge_vec, idx_vj, max_idx_vj + 1)  # (max_idx_vj+1) x ...
-            idx_and_vj = tf.stack([selected_edges[:, 0], selected_edges[:, 2]], axis=1)  # n_selected_edges x 2
-            idx_and_vj = tf.cast(tf.math.unsorted_segment_max(idx_and_vj, idx_vj, max_idx_vj + 1), tf.int32)  # (max_idx_vj+1) x 2
-            edge_vec_aggr = tf.scatter_nd(idx_and_vj, edge_vec_aggr, output_shape)  # batch_size x n_nodes x ...
-        else:
-            raise ValueError('Invalid `at`')
-        return edge_vec_aggr
+        cond = self.f(inputs, **kwargs)
+        out = self.f_cond(inputs, condition=cond, **kwargs)
+        return out
 
 
-class Aggregate_v2(keras.layers.Layer):
-    def call(self, inputs, selected_edges=None, output_shape=None, at='vj', aggr_op='mean', training=None):
-        """ inputs (edge_vec): n_seleted_edges x ...
-            selected_edges: n_selected_edges x 8 ( int32, selected_edges[i] = (idx, vi, vj, rel, idx_vi, idx_vj, new_idx_e2vi, new_idx_e2vj), sorted by idx, vi, vj )
-            output_shape: (n_visited_nodes, ...)
+class Composite4(keras.layers.Layer):
+    """ f -> g (no gate) > f (cond)
+    """
+    def __init__(self, interact, n_dims, name=None):
+        super(Composite4, self).__init__(name=name)
+        self.interact = interact
+        self.n_dims = n_dims
+
+    def build(self, input_shape):
+        self.compsite1 = Composite1(self.interact, self.n_dims, name='f__g_ng')
+        self.f_cond = F(self.interact, self.n_dims, name='f_cond')
+
+    def call(self, inputs, **kwargs):
+        """ kwargs: norm_mode, norm_mix
         """
-        assert selected_edges is not None
-        assert output_shape is not None
-        edge_vec = inputs
-        if at == 'vi':
-            idx_vi = selected_edges[:, 4]  # n_selected_edges
-            aggr_op = tf.math.segment_mean if aggr_op == 'mean' else \
-                tf.math.segment_sum if aggr_op == 'sum' else \
-                tf.math.segment_max if aggr_op == 'max' else None
-            edge_vec_aggr = aggr_op(edge_vec, idx_vi)  # (max_idx_vi+1) x ...
-            new_idx_e2vi = selected_edges[:, 6]  # n_selected_edges
-            reduced_idx_e2vi = tf.cast(tf.math.segment_max(new_idx_e2vi, idx_vi), tf.int32)  # (max_id_vi+1)
-            reduced_idx_e2vi = tf.expand_dims(reduced_idx_e2vi, 1)  # (max_id_vi+1) x 1
-            edge_vec_aggr = tf.scatter_nd(reduced_idx_e2vi, edge_vec_aggr, output_shape)  # n_visited_nodes x ...
-        elif at == 'vj':
-            idx_vj = selected_edges[:, 5]  # n_selected_edges
-            max_idx_vj = tf.reduce_max(idx_vj)
-            aggr_op = tf.math.unsorted_segment_mean if aggr_op == 'mean' else \
-                tf.math.unsorted_segment_sum if aggr_op == 'sum' else \
-                tf.math.unsorted_segment_max if aggr_op == 'max' else None
-            edge_vec_aggr = aggr_op(edge_vec, idx_vj, max_idx_vj + 1)  # (max_idx_vj+1) x ...
-            new_idx_e2vj = selected_edges[:, 7]  # n_selected_edges
-            reduced_idx_e2vj = tf.cast(tf.math.unsorted_segment_max(new_idx_e2vj, idx_vj, max_idx_vj + 1), tf.int32)  # (max_idx_vj+1)
-            reduced_idx_e2vj = tf.expand_dims(reduced_idx_e2vj, 1)  # (max_idx_vj+1) x 1
-            edge_vec_aggr = tf.scatter_nd(reduced_idx_e2vj, edge_vec_aggr, output_shape)  # n_visited_nodes x ...
-        else:
-            raise ValueError('Invalid `at`')
-        return edge_vec_aggr
+        cond = self.compsite1(inputs, **kwargs)
+        out = self.f_cond(inputs, condition=cond, **kwargs)
+        return out
 
 
-def sparse_softmax(logits, segment_ids, sort=True):
+class Composite5(keras.layers.Layer):
+    """ f -> g (with gate) > f (cond)
+    """
+    def __init__(self, interact, n_dims, name=None):
+        super(Composite5, self).__init__(name=name)
+        self.interact = interact
+        self.n_dims = n_dims
+
+    def build(self, input_shape):
+        self.compsite2 = Composite2(self.interact, self.n_dims, name='f__g_wg')
+        self.f_cond = F(self.interact, self.n_dims, name='f_cond')
+
+    def call(self, inputs, **kwargs):
+        """ kwargs: norm_mode, norm_mix
+        """
+        cond = self.compsite2(inputs, **kwargs)
+        out = self.f_cond(inputs, condition=cond, **kwargs)
+        return out
+
+
+class Composite6(keras.layers.Layer):
+    """ f -> f (cond) -> g (no gate)
+    """
+    def __init__(self, interact, n_dims, name=None):
+        super(Composite6, self).__init__(name=name)
+        self.interact = interact
+        self.n_dims = n_dims
+
+    def build(self, input_shape):
+        self.composite3 = Composite3(self.interact, self.n_dims, name='f__f_cond')
+        self.g_ng = G(self.n_dims, use_gate=False, name='g_ng')
+
+    def call(self, inputs, **kwargs):
+        """ kwargs: norm_mode, norm_mix
+        """
+        out = self.composite3(inputs, **kwargs)
+        out = self.g_ng(out, **kwargs)
+        return out
+
+
+class Composite7(keras.layers.Layer):
+    """ f -> f (cond) -> g (with gate)
+    """
+    def __init__(self, interact, n_dims, name=None):
+        super(Composite7, self).__init__(name=name)
+        self.interact = interact
+        self.n_dims = n_dims
+
+    def build(self, input_shape):
+        self.composite3 = Composite3(self.interact, self.n_dims, name='f__f_cond')
+        self.g_wg = G(self.n_dims, use_gate=True, name='g_wg')
+
+    def call(self, inputs, **kwargs):
+        """ kwargs: norm_mode, norm_mix
+        """
+        out = self.composite3(inputs, **kwargs)
+        out = self.g_wg(out, **kwargs)
+        return out
+
+
+class Composite8(keras.layers.Layer):
+    """ f -> g (no gate) > f (cond) -> g (no gate)
+    """
+    def __init__(self, interact, n_dims, name=None):
+        super(Composite8, self).__init__(name=name)
+        self.interact = interact
+        self.n_dims = n_dims
+
+    def build(self, input_shape):
+        self.compsite4 = Composite4(self.interact, self.n_dims, name='f__g_ng__f_cond')
+        self.g_ng = G(self.n_dims, use_gate=False, name='g_ng')
+
+    def call(self, inputs, **kwargs):
+        """ kwargs: norm_mode, norm_mix
+        """
+        out = self.compsite4(inputs, **kwargs)
+        out = self.g_ng(out, **kwargs)
+        return out
+
+
+class Composite9(keras.layers.Layer):
+    """ f -> g (with gate) > f (cond) -> g (with gate)
+    """
+    def __init__(self, interact, n_dims, name=None):
+        super(Composite9, self).__init__(name=name)
+        self.interact = interact
+        self.n_dims = n_dims
+
+    def build(self, input_shape):
+        self.compsite5 = Composite5(self.interact, self.n_dims, name='f__g_wg__f_cond')
+        self.g_wg = G(self.n_dims, use_gate=True, name='g_wg')
+
+    def call(self, inputs, **kwargs):
+        """ kwargs: norm_mode, norm_mix
+        """
+        out = self.compsite5(inputs, **kwargs)
+        out = self.g_wg(out, **kwargs)
+        return out
+
+
+composite_transformer_dct = {
+    'f > g_ng': Composite1,
+    'f > g_wg': Composite2,
+    'f > f_cond': Composite3,
+    'f > g_ng > f_cond': Composite4,
+    'f > g_wg > f_cond': Composite5,
+    'f > f_cond > g_ng': Composite6,
+    'f > f_cond > g_wg': Composite7,
+    'f > g_ng > f_cond > g_ng': Composite8,
+    'f > g_wg > f_cond > g_wg': Composite9
+}
+
+
+class Scorer(keras.layers.Layer):
+    def __init__(self, interact, n_dims, name=None):
+        super(Scorer, self).__init__(name=name)
+        self.interact = interact
+        self.n_dims = n_dims
+
+    def build(self, input_shape):
+        n_prod = len(self.interact)
+        self.pos_weight = self.add_weight(shape=(n_prod, self.n_dims),
+                                          initializer=keras.initializers.constant(
+                                              np.ones((n_prod, self.n_dims), dtype='float32') / n_prod),
+                                          name='pos_weight')
+        self.neg_weight = self.add_weight(shape=(n_prod, self.n_dims),
+                                          initializer=keras.initializers.constant(
+                                              np.ones((n_prod, self.n_dims), dtype='float32') / n_prod),
+                                          name='neg_weight')
+
+    def call(self, inputs, condition=None, use_tanh=False, training=None, **kwargs):
+        """ inputs[i]: bs x ... x n_dims
+            condition: bs x ... x n_dims
+        """
+        pos_xs, neg_xs = [], []
+        for idxs in self.interact:
+            pos_x, neg_x = (1., 1.) if condition is None else (tf.maximum(condition, 0), - tf.minimum(condition, 0))
+            for idx in idxs:
+                pos_x = pos_x * tf.maximum(inputs[idx], 0)
+                neg_x = neg_x * (- tf.minimum(inputs[idx], 0))
+            pos_xs.append(pos_x)  # pos_x: bs x ... x n_dims
+            neg_xs.append(neg_x)  # neg_x: bs x ... x n_dims
+        pos_xs = tf.stack(pos_xs, axis=-2)  # bs x ... x n_prod x n_dims
+        neg_xs = tf.stack(neg_xs, axis=-2)  # bs x ... x n_prod x n_dims
+        pos_out = tf.reduce_sum(pos_xs * self.pos_weight, axis=-1)  # bs x ... x n_prod
+        neg_out = tf.reduce_sum(neg_xs * self.neg_weight, axis=-1)  # bs x ... x n_prod
+        out = tf.reduce_sum(pos_out - neg_out, axis=-1)
+        if use_tanh:
+            out = tf.tanh(out)
+        return out
+
+
+class CompositeS1(keras.layers.Layer):
+    """ f -> scorer (cond)
+    """
+    def __init__(self, interact, n_dims, name=None):
+        super(CompositeS1, self).__init__(name=name)
+        self.interact = interact
+        self.n_dims = n_dims
+
+    def build(self, input_shape):
+        self.f = F(self.interact, self.n_dims, name='f')
+        self.scorer_cond = Scorer(self.interact, self.n_dims, name='scorer_cond')
+
+    def call(self, inputs, use_tanh=False, **kwargs):
+        """ kwargs: norm_mode, norm_mix
+        """
+        cond = self.f(inputs, **kwargs)
+        out = self.scorer_cond(inputs, condition=cond, use_tanh=use_tanh)
+        return out
+
+
+class CompositeS2(keras.layers.Layer):
+    """ f -> g (no gate) -> scorer (cond)
+    """
+
+    def __init__(self, interact, n_dims, name=None):
+        super(CompositeS2, self).__init__(name=name)
+        self.interact = interact
+        self.n_dims = n_dims
+
+    def build(self, input_shape):
+        self.composite1 = Composite1(self.interact, self.n_dims, name='f__g_ng')
+        self.scorer_cond = Scorer(self.interact, self.n_dims, name='scorer_cond')
+
+    def call(self, inputs, use_tanh=False, **kwargs):
+        """ kwargs: norm_mode, norm_mix
+        """
+        cond = self.composite1(inputs, **kwargs)
+        out = self.scorer_cond(inputs, condition=cond, use_tanh=use_tanh)
+        return out
+
+
+class CompositeS3(keras.layers.Layer):
+    """ f -> g (with gate) -> scorer (cond)
+    """
+
+    def __init__(self, interact, n_dims, name=None):
+        super(CompositeS3, self).__init__(name=name)
+        self.interact = interact
+        self.n_dims = n_dims
+
+    def build(self, input_shape):
+        self.composite2 = Composite2(self.interact, self.n_dims, name='f__g_wg')
+        self.scorer_cond = Scorer(self.interact, self.n_dims, name='scorer_cond')
+
+    def call(self, inputs, use_tanh=False, **kwargs):
+        """ kwargs: norm_mode, norm_mix
+        """
+        cond = self.composite2(inputs, **kwargs)
+        out = self.scorer_cond(inputs, condition=cond, use_tanh=use_tanh)
+        return out
+
+
+composite_scorer_dct = {
+    'scorer': Scorer,
+    'f > scorer_cond': CompositeS1,
+    'f > g_ng > scorer_cond': CompositeS2,
+    'f > g_wg > scorer_cond': CompositeS3
+}
+
+
+def update_op(inputs, update, norm_mode, norm_mix=None):
+    out = normalize_op(inputs + update, norm_mode, mix_factor=norm_mix)
+    return out
+
+
+def node2edge_op(inputs, selected_edges, return_vi=True, return_vj=True):
+    """ inputs (hidden): batch_size x n_nodes x n_dims
+        selected_edges: n_selected_edges x 6 (or 8) ( int32, selected_edges[i] = (idx, vi, vj, rel, idx_vi, idx_vj), sorted by idx, vi, vj )
+    """
+    hidden = inputs
+    batch_size = tf.shape(inputs)[0]
+    n_selected_edges = len(selected_edges)
+    idx = tf.cond(tf.equal(batch_size, 1), lambda: tf.zeros((n_selected_edges,), dtype='int32'), lambda: selected_edges[:, 0])
+    result = []
+    if return_vi:
+        idx_and_vi = tf.stack([idx, selected_edges[:, 1]], axis=1)  # n_selected_edges x 2
+        hidden_vi = tf.gather_nd(hidden, idx_and_vi)  # n_selected_edges x n_dims
+        result.append(hidden_vi)
+    if return_vj:
+        idx_and_vj = tf.stack([idx, selected_edges[:, 2]], axis=1)  # n_selected_edges x 2
+        hidden_vj = tf.gather_nd(hidden, idx_and_vj)  # n_selected_edges x n_dims
+        result.append(hidden_vj)
+    return result
+
+
+def node2edge_v2_op(inputs, selected_edges, return_vi=True, return_vj=True):
+    """ inputs (hidden): n_selected_nodes x n_dims
+        selected_edges: n_selected_edges x 8 ( int32, selected_edges[i] = (idx, vi, vj, rel, idx_vi, idx_vj, new_idx_e2vi, new_idx_e2vj), sorted by idx, vi, vj )
+    """
+    assert selected_edges is not None
+    assert return_vi or return_vj
+    hidden = inputs
+    result = []
+    if return_vi:
+        new_idx_e2vi = selected_edges[:, 6]  # n_selected_edges
+        hidden_vi = tf.gather(hidden, new_idx_e2vi)  # n_selected_edges x n_dims
+        result.append(hidden_vi)
+    if return_vj:
+        new_idx_e2vj = selected_edges[:, 7]  # n_selected_edges
+        hidden_vj = tf.gather(hidden, new_idx_e2vj)  # n_selected_edges x n_dims
+        result.append(hidden_vj)
+    return result
+
+
+def aggregate_op(inputs, selected_edges, output_shape, at='vj', aggr_op='mean_v2'):
+    """ inputs (edge_vec): n_seleted_edges x n_dims
+        selected_edges: n_selected_edges x 6 ( int32, selected_edges[i] = (idx, vi, vj, rel, idx_vi, idx_vj), sorted by idx, vi, vj )
+        output_shape: (batch_size=1, n_nodes, n_dims)
+    """
+    assert selected_edges is not None
+    assert output_shape is not None
+    edge_vec = inputs
+    if at == 'vi':
+        idx_vi = selected_edges[:, 4]  # n_selected_edges
+        aggr_op = tf.math.segment_mean if aggr_op == 'mean' or aggr_op == 'mean_v2' else \
+            tf.math.segment_sum if aggr_op == 'sum' else \
+            tf.math.segment_max if aggr_op == 'max' else None
+        edge_vec_aggr = aggr_op(edge_vec, idx_vi)  # (max_idx_vi+1) x n_dims
+        if aggr_op == 'mean_v2':
+            edge_count = tf.math.segment_sum(tf.ones((len(idx_vi), 1)), idx_vi)  # (max_idx_vi+1) x 1
+            edge_vec_aggr = edge_vec_aggr * tf.math.log(tf.math.exp(1) - 1 + edge_count)  # (max_idx_vi+1) x n_dims
+        idx_and_vi = tf.stack([selected_edges[:, 0], selected_edges[:, 1]], axis=1)  # n_selected_edges x 2
+        idx_and_vi = tf.cast(tf.math.segment_max(idx_and_vi, idx_vi), tf.int32)  # (max_id_vi+1) x 2
+        edge_vec_aggr = tf.scatter_nd(idx_and_vi, edge_vec_aggr, output_shape)  # batch_size x n_nodes x n_dims
+    elif at == 'vj':
+        idx_vj = selected_edges[:, 5]  # n_selected_edges
+        max_idx_vj = tf.reduce_max(idx_vj)
+        aggr_op = tf.math.unsorted_segment_mean if aggr_op == 'mean' or aggr_op == 'mean_v2' else \
+            tf.math.unsorted_segment_sum if aggr_op == 'sum' else \
+            tf.math.unsorted_segment_max if aggr_op == 'max' else None
+        edge_vec_aggr = aggr_op(edge_vec, idx_vj, max_idx_vj + 1)  # (max_idx_vj+1) x n_dims
+        if aggr_op == 'mean_v2':
+            edge_count = tf.math.unsorted_segment_sum(tf.ones((len(idx_vj), 1)), idx_vj)  # (max_idx_vj+1) x 1
+            edge_vec_aggr = edge_vec_aggr * tf.math.log(tf.math.exp(1) - 1 + edge_count)  # (max_idx_vj+1) x n_dims
+        idx_and_vj = tf.stack([selected_edges[:, 0], selected_edges[:, 2]], axis=1)  # n_selected_edges x 2
+        idx_and_vj = tf.cast(tf.math.unsorted_segment_max(idx_and_vj, idx_vj, max_idx_vj + 1), tf.int32)  # (max_idx_vj+1) x 2
+        edge_vec_aggr = tf.scatter_nd(idx_and_vj, edge_vec_aggr, output_shape)  # batch_size x n_nodes x n_dims
+    else:
+        raise ValueError('Invalid `at`')
+    return edge_vec_aggr
+
+
+def aggregate_v2_op(inputs, selected_edges, output_shape, at='vj', aggr_op='mean_v2'):
+    """ inputs (edge_vec): n_seleted_edges x n_dims
+        selected_edges: n_selected_edges x 8 ( int32, selected_edges[i] = (idx, vi, vj, rel, idx_vi, idx_vj, new_idx_e2vi, new_idx_e2vj), sorted by idx, vi, vj )
+        output_shape: (n_visited_nodes, n_dims)
+    """
+    assert selected_edges is not None
+    assert output_shape is not None
+    edge_vec = inputs
+    if at == 'vi':
+        idx_vi = selected_edges[:, 4]  # n_selected_edges
+        aggr_op = tf.math.segment_mean if aggr_op == 'mean' or aggr_op == 'mean_v2' else \
+            tf.math.segment_sum if aggr_op == 'sum' else \
+            tf.math.segment_max if aggr_op == 'max' else None
+        edge_vec_aggr = aggr_op(edge_vec, idx_vi)  # (max_idx_vi+1) x n_dims
+        if aggr_op == 'mean_v2':
+            edge_count = tf.math.segment_sum(tf.ones((len(idx_vi), 1)), idx_vi)  # (max_idx_vi+1) x 1
+            edge_vec_aggr = edge_vec_aggr * tf.math.log(tf.math.exp(1) - 1 + edge_count)  # (max_idx_vi+1) x n_dims
+        new_idx_e2vi = selected_edges[:, 6]  # n_selected_edges
+        reduced_idx_e2vi = tf.cast(tf.math.segment_max(new_idx_e2vi, idx_vi), tf.int32)  # (max_id_vi+1)
+        reduced_idx_e2vi = tf.expand_dims(reduced_idx_e2vi, 1)  # (max_id_vi+1) x 1
+        edge_vec_aggr = tf.scatter_nd(reduced_idx_e2vi, edge_vec_aggr, output_shape)  # n_visited_nodes x n_dims
+    elif at == 'vj':
+        idx_vj = selected_edges[:, 5]  # n_selected_edges
+        max_idx_vj = tf.reduce_max(idx_vj)
+        aggr_op = tf.math.unsorted_segment_mean if aggr_op == 'mean' or aggr_op == 'mean_v2' else \
+            tf.math.unsorted_segment_sum if aggr_op == 'sum' else \
+            tf.math.unsorted_segment_max if aggr_op == 'max' else None
+        edge_vec_aggr = aggr_op(edge_vec, idx_vj, max_idx_vj + 1)  # (max_idx_vj+1) x n_dims
+        if aggr_op == 'mean_v2':
+            edge_count = tf.math.unsorted_segment_sum(tf.ones((len(idx_vj), 1)), idx_vj)  # (max_idx_vj+1) x 1
+            edge_vec_aggr = edge_vec_aggr * tf.math.log(tf.math.exp(1) - 1 + edge_count)  # (max_idx_vj+1) x n_dims
+        new_idx_e2vj = selected_edges[:, 7]  # n_selected_edges
+        reduced_idx_e2vj = tf.cast(tf.math.unsorted_segment_max(new_idx_e2vj, idx_vj, max_idx_vj + 1), tf.int32)  # (max_idx_vj+1)
+        reduced_idx_e2vj = tf.expand_dims(reduced_idx_e2vj, 1)  # (max_idx_vj+1) x 1
+        edge_vec_aggr = tf.scatter_nd(reduced_idx_e2vj, edge_vec_aggr, output_shape)  # n_visited_nodes x n_dims
+    else:
+        raise ValueError('Invalid `at`')
+    return edge_vec_aggr
+
+
+def sparse_softmax_op(logits, segment_ids, diff_control=None, sort=True):
     if sort:
         logits_max = tf.math.segment_max(logits, segment_ids)
         logits_max = tf.gather(logits_max, segment_ids)
-        logits_exp = tf.math.exp(logits - logits_max)
+        logits_diff = logits - logits_max
+        if diff_control is not None:
+            logits_diff_max = tf.stop_gradient(tf.math.segment_max(tf.abs(logits_diff), segment_ids))
+            logits_diff_max = tf.gather(tf.maximum(logits_diff_max / diff_control, 1), segment_ids)
+            logits_exp = tf.math.exp(logits_diff / logits_diff_max)
+        else:
+            logits_exp = tf.math.exp(logits_diff)
         logits_expsum = tf.math.segment_sum(logits_exp, segment_ids)
         logits_expsum = tf.gather(logits_expsum, segment_ids)
         logits_norm = logits_exp / logits_expsum
@@ -679,29 +999,34 @@ def sparse_softmax(logits, segment_ids, sort=True):
         num_segments = tf.reduce_max(segment_ids) + 1
         logits_max = tf.math.unsorted_segment_max(logits, segment_ids, num_segments)
         logits_max = tf.gather(logits_max, segment_ids)
-        logits_exp = tf.math.exp(logits - logits_max)
+        logits_diff = logits - logits_max
+        if diff_control is not None:
+            logits_diff_max = tf.stop_gradient(tf.math.unsorted_segment_max(tf.abs(logits_diff), segment_ids, num_segments))
+            logits_diff_max = tf.gather(tf.maximum(logits_diff_max / diff_control, 1), segment_ids)
+            logits_exp = tf.math.exp(logits_diff / logits_diff_max)
+        else:
+            logits_exp = tf.math.exp(logits_diff)
         logits_expsum = tf.math.unsorted_segment_sum(logits_exp, segment_ids, num_segments)
         logits_expsum = tf.gather(logits_expsum, segment_ids)
         logits_norm = logits_exp / logits_expsum
     return logits_norm
 
 
-class NeighborSoftmax(keras.layers.Layer):
-    def call(self, inputs, selected_edges=None, at='vi', training=None):
-        """ inputs (edge_vec): n_seleted_edges x ...
-            selected_edges: n_selected_edges x 8 ( int32, selected_edges[i] = (idx, vi, vj, rel, idx_vi, idx_vj, new_idx_e2vi, new_idx_e2vj), sorted by idx, vi, vj )
-        """
-        assert selected_edges is not None
-        edge_vec = inputs
-        if at == 'vi':
-            idx_vi = selected_edges[:, 4]  # n_selected_edges
-            edge_vec_norm = sparse_softmax(edge_vec, idx_vi)  # n_selected_edges x ...
-        elif at == 'vj':
-            idx_vj = selected_edges[:, 5]  # n_selected_edges
-            edge_vec_norm = sparse_softmax(edge_vec, idx_vj, sort=False)  # n_selected_edges x ...
-        else:
-            raise ValueError('Invalid `at`')
-        return edge_vec_norm
+def neighbor_softmax_op(inputs, selected_edges, at='vi', diff_control=None):
+    """ inputs (edge_vec): n_seleted_edges x ...
+        selected_edges: n_selected_edges x 8 ( int32, selected_edges[i] = (idx, vi, vj, rel, idx_vi, idx_vj, new_idx_e2vi, new_idx_e2vj), sorted by idx, vi, vj )
+    """
+    assert selected_edges is not None
+    edge_vec = inputs
+    if at == 'vi':
+        idx_vi = selected_edges[:, 4]  # n_selected_edges
+        edge_vec_norm = sparse_softmax_op(edge_vec, idx_vi, diff_control=diff_control)  # n_selected_edges x ...
+    elif at == 'vj':
+        idx_vj = selected_edges[:, 5]  # n_selected_edges
+        edge_vec_norm = sparse_softmax_op(edge_vec, idx_vj, diff_control=diff_control, sort=False)  # n_selected_edges x ...
+    else:
+        raise ValueError('Invalid `at`')
+    return edge_vec_norm
 
 
 class Sampler(keras.Model):
@@ -713,7 +1038,7 @@ class Sampler(keras.Model):
                                                     initializer=keras.initializers.zeros(),
                                                     name='edges_logits')  # n_full_edges
 
-    def call(self, _, candidate_edges=None, loglog_u=None, sampled_edges=None, mode=None, training=None, tc=None):
+    def call(self, _, candidate_edges=None, loglog_u=None, sampled_edges=None, mode=None, diff_control=None, training=None, tc=None):
         """ inputs: None
             candidate_edges: (np.array) n_candidate_edges x 5, (eg_idx, edge_id, vi, vj, rel) sorted by (eg_idx, edge_id)
             loglog_u: (np.array) n_candidate_edges
@@ -739,15 +1064,15 @@ class Sampler(keras.Model):
         logits = tf.gather(self.edges_logits, edge_id)  # n_candidate_edges
         ca_idx = sampled_edges[:, 5]  # n_sampled_edges
 
-        edges_y = self._gumbel_softmax(logits, loglog_u, segment_ids, ca_idx)
+        edges_y = self._gumbel_softmax(logits, loglog_u, segment_ids, ca_idx, diff_control=diff_control)
 
         if tc is not None:
             tc['s.call'] += time.time() - t0
         return edges_y  # n_sampled_edges
 
-    def _gumbel_softmax(self, logits, loglog_u, segment_ids, ca_idx, temperature=0.1, hard=True):
+    def _gumbel_softmax(self, logits, loglog_u, segment_ids, ca_idx, diff_control=None, hard=True):
         y = logits + loglog_u  # n_candidate_edges
-        y = sparse_softmax(y / temperature, segment_ids)  # n_candidate_edges
+        y = sparse_softmax_op(y, segment_ids, diff_control=diff_control)  # n_candidate_edges
         y = tf.gather(y, ca_idx)  # n_sampled_edges
         if hard:
             y_hard = tf.ones_like(y)
@@ -755,41 +1080,70 @@ class Sampler(keras.Model):
         return y  # n_sampled_edges
 
 
-class UnconsciousnessFlow(keras.Model):
+class SharedEmbedding(keras.Model):
     def __init__(self, n_entities, n_relations, n_dims_lg, ent_emb_l2, rel_emb_l2):
         """ n_entities: including virtual nodes
-            n_relations: including 'virtual' but not 'selfloop' and 'backtrace'
-            n_dims_lg: uncon flow uses large dimensions
+            n_relations: including 'virtual', 'selfloop' and 'backtrace'
         """
-        super(UnconsciousnessFlow, self).__init__(name='uncon_flow')
-        self.n_nodes = n_entities
+        super(SharedEmbedding, self).__init__(name='shared_emb')
         self.n_dims = n_dims_lg
 
         self.entity_embedding = keras.layers.Embedding(n_entities, self.n_dims,
                                                        embeddings_regularizer=keras.regularizers.l2(ent_emb_l2),
-                                                       name='entities')
+                                                       name='entities')  # n_nodes x n_dims_lg
         self.relation_embedding = keras.layers.Embedding(n_relations, self.n_dims,
                                                          embeddings_regularizer=keras.regularizers.l2(rel_emb_l2),
-                                                         name='relations')
-        self.hidden = None  # 1 x n_nodes x n_dims_lg
+                                                         name='relations')  # n_rels x n_dims_lg
 
-        # f(message_aggr, hidden_prev, ent_emb)
-        self.f_hidden = F([[0], [0, 1], [0, 2], [1], [2], [1, 2]], self.n_dims,
-                          activation=tf.tanh, name='f_hidden')
-        self.g_hidden = G(self.n_dims, activation=tf.tanh, name='g_hidden')
+    def call(self, inputs, target=None, training=None):
+        assert target is not None
+        if target == 'entity':
+            return self.entity_embedding(inputs)
+        elif target == 'relation':
+            return self.relation_embedding(inputs)
+        else:
+            raise ValueError('Invalid `target`')
 
-        # f(hidden_vi, rel_emb, hidden_vj) (vi -> vj: non-symmetric)
-        self.f_message = F([[0], [0, 1], [0, 1, 2]], self.n_dims,
-                           activation=tf.tanh, name='f_msg')
-        self.g_message = G(self.n_dims, activation=tf.tanh, name='g_msg')
 
-        self.nodes_to_edges = Node2Edge()
+class QueryContext(keras.Model):
+    def __init__(self, n_dims_lg, query_fn_name, shared_embedding):
+        super(QueryContext, self).__init__(name='query_context')
+        self.n_dims = n_dims_lg
+        self.shared_embedding = shared_embedding
 
-        self.aggregate = Aggregate()
+        # fn(head_emb, rel_emb)
+        self.query_fn = composite_transformer_dct[query_fn_name](
+            [[0], [1], [0, 1]], self.n_dims, name='query_fn')
 
-        self.gru = ReducedGRU(self.n_dims, name='gru')
+    def call(self, inputs, norm_mode=None, norm_mix=None, training=None):
+        """ inputs: (heads, rels)
+                heads: batch_size
+                rels: batch_size
+        """
+        with tf.name_scope(self.name):
+            heads, rels = inputs
+            head_emb = self.shared_embedding(heads, target='entity')  # batch_size x n_dims_lg
+            rel_emb = self.shared_embedding(rels, target='relation')  # batch_size x n_dims_lg
+            query_context = self.query_fn((head_emb, rel_emb), norm_mode=norm_mode, norm_mix=norm_mix)  # batch_size x n_dims_lg
+        return query_context  # batch_size x n_dims_lg
 
-    def call(self, inputs, selected_edges=None, edges_y=None, training=None, tc=None):
+
+class UnconsciousnessFlow(keras.Model):
+    def __init__(self, n_entities, n_dims_lg, message_fn_name, hidden_fn_name, shared_embedding):
+        super(UnconsciousnessFlow, self).__init__(name='uncon_flow')
+        self.n_nodes = n_entities
+        self.n_dims = n_dims_lg
+        self.shared_embedding = shared_embedding
+
+        # fn(hidden_vi, rel_emb, hidden_vj) (vi -> vj: non-symmetric)
+        self.message_fn = composite_transformer_dct[message_fn_name](
+            [[0], [0, 1], [0, 2], [0, 1, 2]], self.n_dims, name='message_fn')
+
+        # fn(message_aggr, hidden, ent_emb)
+        self.hidden_fn = composite_transformer_dct[hidden_fn_name](
+            [[0], [0, 1], [0, 2], [0, 1, 2]], self.n_dims, name='hidden_fn')
+
+    def call(self, inputs, selected_edges=None, edges_y=None, norm_mode=None, norm_mix=None, training=None, tc=None):
         """ inputs (hidden): 1 x n_nodes x n_dims_lg
             selected_edges: n_selected_edges x 6, (eg_idx, vi, vj, rel, idx_vi, idx_vj) sorted by (eg_idx, vi, vj)
             edges_y: n_selected_edges
@@ -803,24 +1157,20 @@ class UnconsciousnessFlow(keras.Model):
 
         # compute unconscious messages
         hidden = inputs
-        hidden_vi, hidden_vj = self.nodes_to_edges(hidden, selected_edges=selected_edges)  # n_selected_edges x n_dims_lg
+        hidden_vi, hidden_vj = node2edge_op(hidden, selected_edges)  # n_selected_edges x n_dims_lg
         rel_idx = selected_edges[:, 3]  # n_selected_edges
-        rel_emb = self.relation_embedding(rel_idx)  # n_selected_edges x n_dims_lg
-        message = self.f_message((hidden_vi, rel_emb, hidden_vj))  # n_selected_edges x n_dims_lg
-        message = self.g_message(message)  # n_selected_edges x n_dims_lg
+        rel_emb = self.shared_embedding(rel_idx, target='relation')  # n_selected_edges x n_dims_lg
+        message = self.message_fn((hidden_vi, rel_emb, hidden_vj), norm_mode=norm_mode, norm_mix=norm_mix)  # n_selected_edges x n_dims_lg
         message = tf.expand_dims(edges_y, 1) * message  # n_selected_edges x n_dims_lg
 
         # aggregate unconscious messages
-        message_aggr = self.aggregate(message, selected_edges=selected_edges,
-                                      output_shape=(1, self.n_nodes, self.n_dims))  # 1 x n_nodes x n_dims_lg
+        message_aggr = aggregate_op(message, selected_edges, (1, self.n_nodes, self.n_dims))  # 1 x n_nodes x n_dims_lg
 
         # update unconscious states
         ent_idx = tf.expand_dims(tf.range(0, self.n_nodes), axis=0)  # 1 x n_nodes
-        ent_emb = self.entity_embedding(ent_idx)  # 1 x n_nodes x n_dims_lg
-        update = self.f_hidden((message_aggr, hidden, ent_emb))  # 1 x n_nodes x n_dims_lg
-        update = self.g_hidden(update)  # 1 x n_nodes x n_dims_lg
-        hidden = self.gru((hidden, update))  # 1 x n_nodes x n_dims_lg
-        self.hidden = hidden
+        ent_emb = self.shared_embedding(ent_idx, target='entity')  # 1 x n_nodes x n_dims_lg
+        update = self.hidden_fn((message_aggr, hidden, ent_emb), norm_mode=norm_mode, norm_mix=norm_mix)  # 1 x n_nodes x n_dims_lg
+        hidden = update_op(hidden, update, norm_mode=norm_mode, norm_mix=norm_mix)  # 1 x n_nodes x n_dims_lg
 
         if tc is not None:
             tc['u.call'] += time.time() - t0
@@ -828,56 +1178,32 @@ class UnconsciousnessFlow(keras.Model):
 
     def get_init_hidden(self):
         with tf.name_scope(self.name):
-            if self.hidden is not None:
-                hidden = self.hidden  # 1 x n_nodes x n_dims_lg
-            else:
-                ent_idx = tf.expand_dims(tf.range(0, self.n_nodes), axis=0)  # 1 x n_nodes
-                hidden = self.entity_embedding(ent_idx)  # 1 x n_nodes x n_dims_lg
+            ent_idx = tf.expand_dims(tf.range(0, self.n_nodes), axis=0)  # 1 x n_nodes
+            ent_emb = self.shared_embedding(ent_idx, target='entity')  # 1 x n_nodes x n_dims_lg
+            hidden = ent_emb
         return hidden
 
+
 class ConsciousnessFlow(keras.Model):
-    def __init__(self, n_entities, n_relations, n_dims, ent_emb_l2, rel_emb_l2):
-        """ n_entities: including virtual nodes
-            n_relations: including 'virtual', 'selfloop' and 'backtrace'
-        """
+    def __init__(self, n_entities, n_dims, message_fn_name, hidden_fn_name, shared_embedding):
         super(ConsciousnessFlow, self).__init__(name='con_flow')
         self.n_nodes = n_entities
         self.n_dims = n_dims
+        self.shared_embedding = shared_embedding
 
-        self.entity_embedding = keras.layers.Embedding(n_entities, self.n_dims,
-                                                       embeddings_regularizer=keras.regularizers.l2(ent_emb_l2),
-                                                       name='entitys')
-        self.relation_embedding = keras.layers.Embedding(n_relations, self.n_dims,
-                                                         embeddings_regularizer=keras.regularizers.l2(rel_emb_l2),
-                                                         name='relations')
+        # fn(hidden_vi, rel_emb, hidden_vj)
+        self.message_fn = composite_transformer_dct[message_fn_name](
+            [[0], [0, 1], [0, 2], [0, 1, 2]], self.n_dims, name='message_fn')
 
-        # f(head_emb, rel_emb)
-        self.f_query = F([[0], [1], [0,1]], self.n_dims,
-                         activation=tf.tanh, name='f_query')
-        self.g_query = G(self.n_dims, activation=tf.tanh, name='g_query')
+        # fn(message_aggr, hidden, hidden_uncon)
+        self.hidden_fn = composite_transformer_dct[hidden_fn_name](
+            [[0], [0, 1], [0, 2], [0, 1, 2]], self.n_dims, name='hidden_fn')
 
-        # f(message, hidden_uncon, hidden, ent_emb)
-        self.f_hidden = F([[0], [0, 2], [0, 3], [1], [1, 2], [1, 3], [2], [3], [2, 3]], self.n_dims,
-                          activation=tf.tanh, name='f_hidden')
-        self.g_hidden = G(self.n_dims, activation=tf.tanh, name='g_hidden')
-        self.proj = keras.layers.Dense(self.n_dims, activation=tf.tanh, name='proj')
-
-        # f(hidden_vi, rel_emb, hidden_vj)
-        self.f_message = F([[0], [0, 1], [0, 1, 2]], self.n_dims,
-                           activation=tf.tanh, name='f_msg')
-        self.g_message = G(self.n_dims, activation=tf.tanh, name='g_msg')
-
-        # f(trans_attention, message)
-        self.f_attended_message = F([[0, 1]], self.n_dims, use_bias=False, name='f_att_msg')
-
-        self.nodes_to_edges_v2 = Node2Edge_v2()
-
-        self.aggregate_v2 = Aggregate_v2()
-
-        self.gru = ReducedGRU(self.n_dims, name='gru')
+        self.dim_lg_to_dim = keras.layers.Dense(self.n_dims, activation=tf.tanh, name='proj')
 
     def call(self, inputs, seen_edges=None, edges_y=None, trans_attention=None, node_attention=None,
-             hidden_uncon=None, memorized_nodes=None, training=None, tc=None):
+             hidden_uncon=None, memorized_nodes=None, norm_mode=None, norm_mix=None, straight_through=False,
+             training=None, tc=None):
         """ inputs (hidden): n_memorized_nodes x n_dims
             seen_edges: n_seen_edges x 8, (eg_idx, vi, vj, rel, idx_vi, idx_vj, new_idx_e2vi, new_idx_e2vj), sorted by (idx, vi, vj)
                 (1) including selfloop edges and backtrace edges
@@ -898,83 +1224,73 @@ class ConsciousnessFlow(keras.Model):
 
         # compute conscious messages
         hidden = inputs
-        hidden_vi, hidden_vj = self.nodes_to_edges_v2(hidden, seen_edges)  # n_seen_edges x n_dims
+        hidden_vi, hidden_vj = node2edge_v2_op(hidden, seen_edges)  # n_seen_edges x n_dims
         rel_idx = seen_edges[:, 3]  # n_seen_edges
-        rel_emb = self.relation_embedding(rel_idx)  # n_seen_edges x n_dims
-        message = self.f_message((hidden_vi, rel_emb, hidden_vj))  # n_seen_edges x n_dims
-        message = self.g_message(message)  # n_seen_edges x n_dims
-        message = tf.expand_dims(edges_y, 1) * message
+        rel_emb = self.shared_embedding(rel_idx, target='relation')  # n_seen_edges x n_dims_lg
+        rel_emb = self.dim_lg_to_dim(rel_emb)  # n_seen_edges x n_dims
+        message = self.message_fn((hidden_vi, rel_emb, hidden_vj), norm_mode=norm_mode, norm_mix=norm_mix)  # n_seen_edges x n_dims
+        message = tf.expand_dims(edges_y, 1) * message  # n_seen_edges x n_dims
 
-        # attend conscious messages
-        message = self.f_attended_message((tf.expand_dims(trans_attention, 1), message))  # n_seen_edges x n_dims
+        # attend conscious messages (hard, straight throught)
+        if straight_through:
+            trans_attention = tf.stop_gradient(tf.ones_like(trans_attention) - trans_attention) + trans_attention  # n_seen_edges
+            message = tf.expand_dims(trans_attention, 1) * message  # n_seen_edges x n_dims
 
         # aggregate conscious messages
         n_memorized_nodes = tf.shape(hidden)[0]
-        message_aggr = self.aggregate_v2(message, selected_edges=seen_edges,
-                                         output_shape=(n_memorized_nodes, self.n_dims))  # n_memorized_nodes x n_dims
+        message_aggr = aggregate_v2_op(message, seen_edges, (n_memorized_nodes, self.n_dims))  # n_memorized_nodes x n_dims
 
-        # update conscious messages
+        # get unconscious states
         idx, v = memorized_nodes[:, 0], memorized_nodes[:, 1]  # n_memorized_nodes, n_memorized_nodes
-        v_emb = self.entity_embedding(v)  # n_memorized_nodes x n_dims
         hidden_uncon = tf.squeeze(hidden_uncon, axis=0)  # n_nodes x n_dims_lg
-        hidden_uncon = self.proj(hidden_uncon)  # n_nodes x n_dims
-        hidden_uncon = tf.gather(hidden_uncon, v)  # n_memorized_nodes x n_dims
-        update = self.f_hidden((message_aggr, hidden_uncon, hidden, v_emb))  # n_memorized_nodes x n_dims
-        update = self.g_hidden(update)
-        hidden = self.gru((hidden, update))
+        hidden_uncon = tf.gather(hidden_uncon, v)  # n_memorized_nodes x n_dims_lg
+        hidden_uncon = self.dim_lg_to_dim(hidden_uncon)  # n_memorized_nodes x n_dims
+
+        # attend unconscious states (hard, straight throught)
+        if straight_through:
+            idx_and_v = tf.stack([idx, v], axis=1)  # n_memorized_nodes x 2
+            node_attention = tf.gather_nd(node_attention, idx_and_v)  # n_memorized_nodes
+            node_attention = tf.stop_gradient(tf.ones_like(node_attention) - node_attention) + node_attention  # n_memorized_nodes
+            hidden_uncon = tf.expand_dims(node_attention, 1) * hidden_uncon  # n_memorized_nodes x n_dims
+
+        # update conscious state
+        update = self.hidden_fn((message_aggr, hidden, hidden_uncon), norm_mode=norm_mode, norm_mix=norm_mix)  # n_memorized_nodes x n_dims
+        hidden = update_op(hidden, update, norm_mode=norm_mode, norm_mix=norm_mix)  # n_memorized_nodes x n_dims
 
         if tc is not None:
             tc['c.call'] += time.time() - t0
         return hidden  # n_memorized_nodes x n_dims
 
-    def get_init_hidden(self, query_context, hidden_uncon, memorized_v, tc=None):
-        """ query_context: batch_size x n_dims
-            hidden_uncon: 1 x n_nodes x n_dims_lg
-            memorized_v: n_memorized_nodes (=batch_size) x 2, (eg_idx, v)
+    def get_init_hidden(self, hidden_uncon, memorized_nodes):
+        """ hidden_uncon: 1 x n_nodes x n_dims_lg
+            memorized_nodes: n_memorized_nodes (=batch_size) x 2, (eg_idx, v)
         """
-        if tc is not None:
-            t0 = time.time()
-
         with tf.name_scope(self.name):
-            eg_idx, v = memorized_v[:, 0], memorized_v[:, 1]  # n_memorized_nodes, n_memorized_nodes
-            v_emb = self.entity_embedding(v)  # n_memorized_nodes x n_dims
-            message = tf.gather(query_context, eg_idx)  # n_memorized_nodes x n_dims
+            idx, v = memorized_nodes[:, 0], memorized_nodes[:, 1]  # n_memorized_nodes, n_memorized_nodes
             hidden_uncon = tf.squeeze(hidden_uncon, axis=0)  # n_nodes x n_dims_lg
-            hidden_uncon = self.proj(hidden_uncon)  # n_nodes x n_dims
-            hidden_uncon = tf.gather(hidden_uncon, v)  # n_memorized_nodes x n_dims
-            hidden_prev = tf.zeros_like(v_emb)  # n_memorized_nodes x n_dims
-            hidden_init = self.f_hidden((message, hidden_uncon, hidden_prev, v_emb))  # n_memorized_nodes x n_dims
-            hidden_init = self.g_hidden(hidden_init)  # n_memorized_nodes x n_dims
-
-        if tc is not None:
-            tc['c.init'] += time.time() - t0
+            hidden_uncon = tf.gather(hidden_uncon, v)  # n_memorized_nodes x n_dims_lg
+            hidden_uncon = self.dim_lg_to_dim(hidden_uncon)  # n_memorized_nodes x n_dims
+            hidden_init = hidden_uncon
         return hidden_init  # n_memorized_nodes x n_dims
 
 
 class AttentionFlow(keras.Model):
-    def __init__(self, n_entities, n_relations, n_dims_sm, rel_emb_l2):
+    def __init__(self, n_entities, n_dims_sm, transition_fn_name, shared_embedding):
         super(AttentionFlow, self).__init__(name='att_flow')
         self.n_nodes = n_entities
         self.n_dims = n_dims_sm
+        self.shared_embedding = shared_embedding
 
-        self.relation_embedding = keras.layers.Embedding(n_relations, self.n_dims,
-                                                         embeddings_regularizer=keras.regularizers.l2(rel_emb_l2),
-                                                         name='relations')
-        # f(hidden_con_vi, hidden_uncon_vi, rel_emb, hidden_con_vj, hidden_uncon_vj)
-        self.f_transition = F([[0, 3], [0, 2, 3], [0, 4], [0, 2, 4], [1, 3], [1, 2, 3], [1, 4], [1, 2, 4]], self.n_dims,
-                              activation=tf.nn.relu, output_weight=True, output_bias=True, name='f_trans')
-        self.proj_con = keras.layers.Dense(self.n_dims, activation=tf.tanh, name='proj_con')
-        self.proj_uncon = keras.layers.Dense(self.n_dims, activation=tf.tanh, name='proj_uncon')
+        # fn(hidden_con_vi, rel_emb, hidden_con_vj, hidden_uncon_vj, query_context)
+        self.transition_fn = composite_scorer_dct[transition_fn_name](
+            [[0, 2, 4], [0, 3, 4], [0, 2, 3, 4], [0, 1, 2, 4], [0, 1, 3, 4], [0, 1, 2, 3, 4]], self.n_dims, name='transition_fn')
 
-        self.nodes_to_edges = Node2Edge()
-        self.nodes_to_edges_v2 = Node2Edge_v2()
+        self.dim_lg_to_dim_sm = keras.layers.Dense(self.n_dims, activation=tf.tanh, name='proj')
+        self.dim_to_dim_sm = keras.layers.Dense(self.n_dims, activation=tf.tanh, name='proj')
 
-        self.neighbor_softmax = NeighborSoftmax()
-
-        self.aggregate = Aggregate()
-
-    def call(self, inputs, scanned_edges=None, edges_y=None, hidden_uncon=None, hidden_con=None,
-             new_idx_for_memorized=None, n_memorized_and_scanned_nodes=None, training=None, tc=None):
+    def call(self, inputs, scanned_edges=None, edges_y=None, hidden_uncon=None, hidden_con=None, query_context=None,
+             new_idx_for_memorized=None, n_memorized_and_scanned_nodes=None, use_tanh_for_logits=False,
+             norm_mode=None, norm_mix=None, diff_control=None, training=None, tc=None):
         """ inputs (node_attention): batch_size x n_nodes
             scanned_edges (aug_scanned_edges): n_aug_scanned_edges x 8, (eg_idx, vi, vj, rel, idx_vi, idx_vj, new_idx_e2vi, new_idx_e2vj) sorted by (eg_idx, vi, vj)
               (1) including selfloop edges and backtrace edges
@@ -982,49 +1298,52 @@ class AttentionFlow(keras.Model):
             edges_y: n_aug_scanned_edges ( sorted according to scanned_edges )
             hidden_uncon: 1 x n_nodes x n_dims_lg
             hidden_con: n_memorized_nodes x n_dims
+            query_context: batch_size x n_dims_lg
         """
         assert scanned_edges is not None
         assert edges_y is not None
         assert hidden_con is not None
         assert hidden_uncon is not None
+        assert query_context is not None
         assert n_memorized_and_scanned_nodes is not None
         if tc is not None:
             t0 = time.time()
 
-        hidden_con = self.proj_con(hidden_con)  # n_memorized_nodes x n_dims_sm
-
+        hidden_con = self.dim_to_dim_sm(hidden_con)  # n_memorized_nodes x n_dims_sm
         if new_idx_for_memorized is not None:
             hidden_con = tf.scatter_nd(new_idx_for_memorized, hidden_con,
                                        tf.TensorShape((n_memorized_and_scanned_nodes, self.n_dims)))  # n_memorized_and_scanned_nodes x n_dims_sm
-
-        hidden_uncon = self.proj_uncon(hidden_uncon)  # 1 x n_nodes x n_dims_sm
+        hidden_uncon = self.dim_lg_to_dim_sm(hidden_uncon)  # 1 x n_nodes x n_dims_sm
+        query_context = self.dim_lg_to_dim_sm(query_context)  # batch_size x n_dims_sm
 
         # compute transition
-        hidden_con_vi, hidden_con_vj = self.nodes_to_edges_v2(hidden_con, scanned_edges)  # n_aug_scanned_edges x n_dims_sm
-
-        hidden_uncon_vi, hidden_uncon_vj = self.nodes_to_edges(hidden_uncon, scanned_edges)  # n_aug_scanned_edges x n_dims_sm
-
+        hidden_con_vi, hidden_con_vj = node2edge_v2_op(hidden_con, scanned_edges)  # n_aug_scanned_edges x n_dims_sm
+        hidden_uncon_vj, = node2edge_op(hidden_uncon, scanned_edges, return_vi=False)  # n_aug_scanned_edges x n_dims_sm
         rel_idx = scanned_edges[:, 3]  # n_aug_scanned_edges
-        rel_emb = self.relation_embedding(rel_idx)  # n_aug_scanned_edges x n_dims_sm
+        rel_emb = self.shared_embedding(rel_idx, target='relation')  # n_aug_scanned_edges x n_dims_lg
+        rel_emb = self.dim_lg_to_dim_sm(rel_emb)  # n_aug_scanned_edges x n_dims_sm
+        eg_idx = scanned_edges[:, 0]  # n_aug_scanned_edges
+        query_context = tf.gather(query_context, eg_idx)  # n_aug_scanned_edges x n_dims_sm
 
-        transition_logits = self.f_transition((hidden_con_vi, hidden_uncon_vi, rel_emb, hidden_con_vj, hidden_uncon_vj))  # n_aug_scanned_edges x n_dims_sm
-        transition_logits = tf.reduce_sum(transition_logits, axis=1)  # n_aug_scanned_edges
-
-        transition = self.neighbor_softmax(transition_logits, selected_edges=scanned_edges)  # n_aug_scanned_edges
+        transition_logits = self.transition_fn((hidden_con_vi, rel_emb, hidden_con_vj, hidden_uncon_vj, query_context),
+                                               use_tanh=use_tanh_for_logits, norm_mode=norm_mode, norm_mix=norm_mix)  # n_aug_scanned_edges
+        transition = neighbor_softmax_op(transition_logits, scanned_edges, diff_control=diff_control)  # n_aug_scanned_edges
 
         # compute transition attention
         node_attention = inputs  # batch_size x n_nodes
         idx_and_vi = tf.stack([scanned_edges[:, 0], scanned_edges[:, 1]], axis=1)  # n_aug_scanned_edges x 2
-        node_attention = tf.gather_nd(node_attention, idx_and_vi)  # n_aug_scanned_edges
-        trans_attention = node_attention * transition * edges_y  # n_aug_scanned_edges
+        gathered_node_attention = tf.gather_nd(node_attention, idx_and_vi)  # n_aug_scanned_edges
+        trans_attention = gathered_node_attention * transition * edges_y  # n_aug_scanned_edges
 
         # compute new node attention
         batch_size = tf.shape(inputs)[0]
-        new_node_attention = self.aggregate(trans_attention, selected_edges=scanned_edges,  # batch_size x n_nodes
-                                            output_shape=(batch_size, self.n_nodes),
-                                            at='vj', aggr_op='sum')
-        new_node_attention_sum = tf.reduce_sum(new_node_attention, axis=1, keepdims=True)  # batch_size x 1
-        new_node_attention = new_node_attention / new_node_attention_sum  # batch_size x n_nodes
+        new_node_attention = aggregate_op(trans_attention, scanned_edges, (batch_size, self.n_nodes), aggr_op='sum')  # batch_size x n_nodes
+
+        idx_vi = scanned_edges[:, 4]  # n_aug_scanned_edges
+        idx_and_vi = tf.cast(tf.math.segment_max(idx_and_vi, idx_vi), tf.int32)  # (max_id_vi+1) x 2
+        mask = 1 - tf.scatter_nd(idx_and_vi, tf.ones((tf.shape(idx_and_vi)[0],)), tf.shape(node_attention))  # batch_size x n_nodes
+
+        new_node_attention = node_attention * mask + new_node_attention
 
         if tc is not None:
             tc['a.call'] += time.time() - t0
@@ -1033,19 +1352,9 @@ class AttentionFlow(keras.Model):
         return trans_attention, new_node_attention
 
     def get_init_node_attention(self, heads, tc=None):
-        if tc is not None:
-            t0 = time.time()
-
         with tf.name_scope(self.name):
             node_attention = tf.one_hot(heads, self.n_nodes)  # batch_size x n_nodes
-
-        if tc is not None:
-            tc['a.init'] += time.time() - t0
         return node_attention
-
-
-class SharedEmbedding(keras.Model):
-    def __init__(self, n_):
 
 
 class Model(object):
@@ -1054,41 +1363,36 @@ class Model(object):
         self.hparams = hparams
 
         self.sampler = Sampler(graph)
-        self.uncon_flow = UnconsciousnessFlow(graph.n_entities, graph.n_relations, hparams.n_dims_lg,
-                                              hparams.ent_emb_l2, hparams.rel_emb_l2)
-        self.con_flow = ConsciousnessFlow(graph.n_entities, graph.n_aug_relations, hparams.n_dims,
-                                          hparams.ent_emb_l2, hparams.rel_emb_l2)
-        self.att_flow = AttentionFlow(graph.n_entities, graph.n_aug_relations, hparams.n_dims_sm,
-                                      hparams.rel_emb_l2)
-        self.node_attention_trace = None
 
-    def get_query_context(self, heads, rels, tc=None):
+        self.shared_embedding = SharedEmbedding(graph.n_entities, graph.n_relations, hparams.n_dims_lg,
+                                                hparams.ent_emb_l2, hparams.rel_emb_l2)
+
+        self.query_context = QueryContext(hparams.n_dims_lg, hparams.query_fn, self.shared_embedding)
+
+        self.uncon_flow = UnconsciousnessFlow(graph.n_entities, hparams.n_dims_lg,
+                                              hparams.uncon_message_fn, hparams.uncon_hidden_fn, self.shared_embedding)
+
+        self.con_flow = ConsciousnessFlow(graph.n_entities, hparams.n_dims,
+                                          hparams.con_message_fn, hparams.con_hidden_fn, self.shared_embedding)
+
+        self.att_flow = AttentionFlow(graph.n_entities, hparams.n_dims_sm, hparams.transition_fn, self.shared_embedding)
+
+    def get_hparam_by_epoch(self, hparam, epoch):
+        if not isinstance(hparam, (list, tuple)):
+            return hparam
+        else:
+            return hparam[int(len(hparam) * (epoch - 1) / self.hparams.max_epochs)]
+
+    def initialize(self, heads, rels, epoch, tc=None):
         """ heads: batch_size
             rels: batch_size
         """
-        if tc is not None:
-            t0 = time.time()
-
-        with tf.name_scope(self.name):
-            head_emb = self.entity_embedding(heads)  # batch_size x n_dims
-            rel_emb = self.relation_embedding(rels)  # batch_size x n_dims
-            query_context = self.f_query((head_emb, rel_emb))
-            query_context = self.g_query(query_context)
-
-        if tc is not None:
-            tc['c.query'] += time.time() - t0
-        return query_context  # batch_size x n_dims
-
-    def initialize(self, heads, rels, training=True, tc=None):
-        """ heads: batch_size
-            rels: batch_size
-        """
-        ''' initialize unconsciousness flow at the beginning of each batch (with backprop) '''
+        ''' initialize unconsciousness flow'''
         hidden_uncon = self.uncon_flow.get_init_hidden()  # 1 x n_nodes x n_dims_lg
 
-        ''' run unconsciousness flow initially for multiple steps '''
-        if self.hparams.init_uncon_steps_per_batch is not None and training:
-            for _ in range(self.hparams.init_uncon_steps_per_batch):
+        ''' run unconsciousness flow before running consciousness flow '''
+        if self.hparams.init_uncon_steps is not None:
+            for _ in range(self.hparams.init_uncon_steps):
                 # candidate_edges: (np.array) n_candidate_edges x 5, (eg_idx, edge_id, vi, vj, rel) sorted by (eg_idx, edge_id)
                 candidate_edges = self.graph.get_candidate_edges(tc=get(tc, 'graph'))
 
@@ -1100,42 +1404,45 @@ class Model(object):
                                                                   tc=get(tc, 'graph'))
 
                 # edges_y: (tf.Tensor) n_sample_edges
+                diff_control = self.get_hparam_by_epoch(self.hparams.diff_control_for_sampling, epoch)
                 edges_y = self.sampler(None, candidate_edges=candidate_edges, loglog_u=loglog_u,
-                                       sampled_edges=sampled_edges, mode='by_eg', tc=get(tc, 'model'))
+                                       sampled_edges=sampled_edges, mode='by_eg', diff_control=diff_control, tc=get(tc, 'model'))
 
                 # selected_edges: (np.array) n_selected_edges (=n_sampled_edges) x 6, (eg_idx, vi, vj, rel, idx_vi, idx_vj] sorted by (eg_idx, vi, vj)
                 selected_edges = self.graph.get_selected_edges(sampled_edges, tc=get(tc, 'graph'))
 
                 hidden_uncon = self.uncon_flow(hidden_uncon, selected_edges=selected_edges, edges_y=edges_y,
+                                               norm_mode=self.hparams.norm_mode, norm_mix=self.hparams.norm_mix,
                                                tc=get(tc, 'model'))  # 1 x n_nodes x n_dims_lg
 
         ''' initialize attention flow '''
         node_attention = self.att_flow.get_init_node_attention(heads)  # batch_size x n_nodes
 
         ''' initialize consciousness flow '''
-        query_context = self.con_flow.get_query_context(heads, rels)  # batch_size x n_dims
-        memorized_v = self.graph.set_init_memorized_nodes(heads)  # n_memorized_nodes (=batch_size) x 2, (eg_idx, v)
-        hidden_con = self.con_flow.get_init_hidden(query_context, hidden_uncon, memorized_v)  # n_memorized_nodes x n_dims
+        query_context = self.query_context((heads, rels),
+                                           norm_mode=self.hparams.norm_mode, norm_mix=self.hparams.norm_mix)  # batch_size x n_dims_lg
 
-        self.node_attention_trace = [node_attention]
+        memorized_v = self.graph.set_init_memorized_nodes(heads)  # n_memorized_nodes (=batch_size) x 2, (eg_idx, v)
+        hidden_con = self.con_flow.get_init_hidden(hidden_uncon, memorized_v)  # n_memorized_nodes x n_dims
 
         self.graph.set_node_attention_li(node_attention)
         self.graph.set_attended_nodes_li()
 
         # hidden_uncon: 1 x n_nodes x n_dims_lg
-        # hidden_con: n_memorized_nodes
+        # hidden_con: n_memorized_nodes x n_dims
         # node_attention: batch_size x n_nodes
-        return hidden_uncon, hidden_con, node_attention
+        # query_context: batch_size x n_dims_lg
+        return hidden_uncon, hidden_con, node_attention, query_context
 
-    def flow(self, hidden_uncon, hidden_con, node_attention, tc=None):
+    def flow(self, hidden_uncon, hidden_con, node_attention, query_context, epoch, tc=None):
         """ hidden_uncon: 1 x n_nodes x n_dims_lg
             hidden_con: n_memorized_nodes x n_dims
             node_attention: batch_size x n_nodes
         """
         ''' run unconsciousness flow '''
-        if self.hparams.simultaneous_uncon_flow and training:
+        if self.hparams.simultaneous_uncon_flow:
             # candidate_edges: (np.array) n_candidate_edges x 5, (eg_idx, edge_id, vi, vj, rel) sorted by (eg_idx, edge_id)
-            candidate_edges = self.graph.get_candidate_edges(get(tc, 'graph'))
+            candidate_edges = self.graph.get_candidate_edges(tc=get(tc, 'graph'))
 
             # loglog_u: (np.array) n_candidate_edges
             # sampled_edges: (np.array) n_sampled_edges x 6, (eg_idx, edge_id, vi, vj, rel, ca_idx) sorted by (eg_idx, edge_id)
@@ -1145,13 +1452,15 @@ class Model(object):
                                                               tc=get(tc, 'graph'))
 
             # edges_y: (tf.Tensor) n_sample_edges
+            diff_control = self.get_hparam_by_epoch(self.hparams.diff_control_for_sampling, epoch)
             edges_y = self.sampler(None, candidate_edges=candidate_edges, loglog_u=loglog_u,
-                                   sampled_edges=sampled_edges, mode='by_eg', tc=get(tc, 'model'))
+                                   sampled_edges=sampled_edges, mode='by_eg', diff_control=diff_control, tc=get(tc, 'model'))
 
             # selected_edges: (np.array) n_selected_edges (=n_sampled_edges) x 6, (eg_idx, vi, vj, rel, idx_vi, idx_vj] sorted by (eg_idx, vi, vj)
             selected_edges = self.graph.get_selected_edges(sampled_edges, tc=get(tc, 'graph'))
 
             new_hidden_uncon = self.uncon_flow(hidden_uncon, selected_edges=selected_edges, edges_y=edges_y,
+                                               norm_mode=self.hparams.norm_mode, norm_mix=self.hparams.norm_mix,
                                                tc=get(tc, 'model'))  # 1 x n_nodes x n_dims_lg
         else:
             new_hidden_uncon = hidden_uncon  # 1 x n_nodes x n_dims_lg
@@ -1173,8 +1482,9 @@ class Model(object):
                                                           tc=get(tc, 'graph'))
 
         # edges_y: (tf.Tensor) n_sample_edges
+        diff_control = self.get_hparam_by_epoch(self.hparams.diff_control_for_sampling, epoch)
         edges_y = self.sampler(None, candidate_edges=candidate_edges, loglog_u=loglog_u,
-                               sampled_edges=sampled_edges, mode='by_vi', tc=get(tc, 'model'))
+                               sampled_edges=sampled_edges, mode='by_vi', diff_control=diff_control, tc=get(tc, 'model'))
 
         # scanned_edges: (np.array) n_scanned_edges (=n_sampled_edges) x 6, (eg_idx, vi, vj, rel, idx_vi, idx_vj) sorted by (eg_idx, vi, vj)
         scanned_edges = self.graph.get_selected_edges(sampled_edges, tc=get(tc, 'graph'))
@@ -1202,12 +1512,17 @@ class Model(object):
         # aug_scanned_edges: n_aug_scanned_edges x 8, (eg_idx, vi, vj, rel, idx_vi, idx_vj, new_idx_e2vi, new_idx_e2vj) sorted by (eg_idx, vi, vj)
         aug_scanned_edges = self.graph.set_index_over_nodes(aug_scanned_edges, memorized_and_scanned, tc=get(tc, 'graph'))
 
+        diff_control = self.get_hparam_by_epoch(self.hparams.diff_control_for_transition, epoch)
         trans_attention, new_node_attention = self.att_flow(node_attention, scanned_edges=aug_scanned_edges,
-                                                            edges_y=edges_y, hidden_uncon=hidden_uncon,
-                                                            hidden_con=hidden_con, new_idx_for_memorized=new_idx_for_memorized,
+                                                            edges_y=edges_y, hidden_uncon=new_hidden_uncon,
+                                                            hidden_con=hidden_con, query_context=query_context,
+                                                            new_idx_for_memorized=new_idx_for_memorized,
                                                             n_memorized_and_scanned_nodes=n_memorized_and_scanned_nodes,
+                                                            use_tanh_for_logits=self.hparams.use_tanh_for_logits,
+                                                            norm_mode=self.hparams.norm_mode,
+                                                            norm_mix=self.hparams.norm_mix,
+                                                            diff_control=diff_control,
                                                             tc=get(tc, 'model'))  # n_aug_scanned_edges, batch_size x n_nodes
-        self.node_attention_trace.append(new_node_attention)
 
         ''' get seen edges '''
         # seen_nodes: (np.array) n_seen_nodes x 2, (eg_idx, vj) unique and sorted
@@ -1238,7 +1553,9 @@ class Model(object):
 
         new_hidden_con = self.con_flow(hidden_con, seen_edges=seen_edges, edges_y=edges_y,
                                        trans_attention=trans_attention, node_attention=new_node_attention,
-                                       hidden_uncon=hidden_uncon, memorized_nodes=self.graph.memorized_nodes,
+                                       hidden_uncon=new_hidden_uncon, memorized_nodes=self.graph.memorized_nodes,
+                                       norm_mode=self.hparams.norm_mode, norm_mix=self.hparams.norm_mix,
+                                       straight_through=self.hparams.straight_through,
                                        tc=get(tc, 'model'))  # n_memorized_nodes (new) x n_dims
 
         ''' do storing work at the end of each step '''
@@ -1252,13 +1569,13 @@ class Model(object):
 
     @property
     def regularization_loss(self):
-        return tf.add_n(self.uncon_flow.losses) + \
-               tf.add_n(self.con_flow.losses) + \
-               tf.add_n(self.att_flow.losses)
+        return tf.add_n(self.shared_embedding.losses)
 
     @property
     def trainable_variables(self):
         return self.sampler.trainable_variables + \
+               self.shared_embedding.trainable_variables + \
+               self.query_context.trainable_variables + \
                self.uncon_flow.trainable_variables + \
                self.con_flow.trainable_variables + \
                self.att_flow.trainable_variables
@@ -1269,25 +1586,40 @@ class Model(object):
 parser = argparse.ArgumentParser()
 
 # FB237
+"""
 parser.add_argument('-bs', '--batch_size', type=int, default=100)
-parser.add_argument('--n_dims_sm', type=int, default=50)
+parser.add_argument('--n_dims_sm', type=int, default=10)
 parser.add_argument('--n_dims', type=int, default=100)
-parser.add_argument('--n_dims_lg', type=int, default=1000)
+parser.add_argument('--n_dims_lg', type=int, default=500)
 parser.add_argument('--ent_emb_l2', type=float, default=0.)
 parser.add_argument('--rel_emb_l2', type=float, default=0.)
+parser.add_argument('--query_fn', default='f > g_ng')
+parser.add_argument('--uncon_message_fn', default='f > g_ng')
+parser.add_argument('--uncon_hidden_fn', default='f > g_ng')
+parser.add_argument('--con_message_fn', default='f > g_ng')
+parser.add_argument('--con_hidden_fn', default='f > g_ng')
+parser.add_argument('--transition_fn', default='scorer')
+parser.add_argument('--use_tanh_for_logits', action='store_true', default=False)
+parser.add_argument('--diff_control_for_sampling', nargs=3, type=float, default=[1,2,3])
+parser.add_argument('--diff_control_for_transition', nargs=3, type=float, default=[1,2,3])
+parser.add_argument('--straight_through', action='store_true', default=True)
+parser.add_argument('--norm_mode', default='tanh')
+parser.add_argument('--norm_mix', type=float, default=0.5)
 parser.add_argument('--max_edges_per_example', type=int, default=10000)
 parser.add_argument('--max_attended_nodes', type=int, default=10)
 parser.add_argument('--max_edges_per_node', type=int, default=100)
-parser.add_argument('--max_backtrace_edges', type=int, default=10)
+parser.add_argument('--max_backtrace_nodes', type=int, default=10)
 parser.add_argument('--backtrace_decay', type=float, default=1.)
 parser.add_argument('--max_seen_nodes', type=int, default=100)
 parser.add_argument('--max_epochs', type=int, default=10)
 parser.add_argument('--n_clustering', type=int, default=0)
 parser.add_argument('--n_clusters_per_clustering', type=int, default=0)
-parser.add_argument('--connected_clustering', action='store_true', default=False)
-parser.add_argument('--init_uncon_steps_per_batch', type=int, default=1)
+parser.add_argument('--connected_clustering', action='store_true', default=True)
+parser.add_argument('--init_uncon_steps', type=int, default=1)
 parser.add_argument('--simultaneous_uncon_flow', action='store_true', default=False)
 parser.add_argument('--max_steps', type=int, default=5)
+parser.add_argument('--n_rollouts_for_train', type=int, default=1)
+parser.add_argument('--n_rollouts_for_eval', type=int, default=1)
 parser.add_argument('--learning_rate', type=float, default=0.005)
 parser.add_argument('--dataset', default='FB237')
 parser.add_argument('--timer', action='store_true', default=False)
@@ -1296,16 +1628,58 @@ parser.add_argument('--print_train_freq', type=int, default=1)
 parser.add_argument('--print_eval', action='store_true', default=True)
 parser.add_argument('--print_eval_freq', type=int, default=100)
 parser.add_argument('--moving_mean_decay', type=float, default=0.99)
+"""
 
+parser.add_argument('-bs', '--batch_size', type=int, default=100)
+parser.add_argument('--n_dims_sm', type=int, default=20)
+parser.add_argument('--n_dims', type=int, default=100)
+parser.add_argument('--n_dims_lg', type=int, default=500)
+parser.add_argument('--ent_emb_l2', type=float, default=0.)
+parser.add_argument('--rel_emb_l2', type=float, default=0.)
+parser.add_argument('--query_fn', default='f > g_wg > f_cond > g_wg')
+parser.add_argument('--uncon_message_fn', default='f > g_wg > f_cond > g_wg')
+parser.add_argument('--uncon_hidden_fn', default='f > g_wg > f_cond > g_wg')
+parser.add_argument('--con_message_fn', default='f > g_wg > f_cond > g_wg')
+parser.add_argument('--con_hidden_fn', default='f > g_wg > f_cond > g_wg')
+parser.add_argument('--transition_fn', default='f > g_wg > scorer_con')
+parser.add_argument('--use_tanh_for_logits', action='store_true', default=False)
+parser.add_argument('--diff_control_for_sampling', nargs=3, type=float, default=[1,2,3])
+parser.add_argument('--diff_control_for_transition', nargs=3, type=float, default=[1,2,3])
+parser.add_argument('--straight_through', action='store_true', default=True)
+parser.add_argument('--norm_mode', default='mix')
+parser.add_argument('--norm_mix', type=float, default=0.5)
+parser.add_argument('--max_edges_per_example', type=int, default=10000)
+parser.add_argument('--max_attended_nodes', type=int, default=10)
+parser.add_argument('--max_edges_per_node', type=int, default=100)
+parser.add_argument('--max_backtrace_nodes', type=int, default=10)
+parser.add_argument('--backtrace_decay', type=float, default=1.)
+parser.add_argument('--max_seen_nodes', type=int, default=100)
+parser.add_argument('--max_epochs', type=int, default=10)
+parser.add_argument('--n_clustering', type=int, default=0)
+parser.add_argument('--n_clusters_per_clustering', type=int, default=0)
+parser.add_argument('--connected_clustering', action='store_true', default=True)
+parser.add_argument('--init_uncon_steps', type=int, default=3)
+parser.add_argument('--simultaneous_uncon_flow', action='store_true', default=False)
+parser.add_argument('--max_steps', type=int, default=5)
+parser.add_argument('--n_rollouts_for_train', type=int, default=1)
+parser.add_argument('--n_rollouts_for_eval', type=int, default=5)
+parser.add_argument('--learning_rate', type=float, default=0.005)
+parser.add_argument('--dataset', default='FB237')
+parser.add_argument('--timer', action='store_true', default=False)
+parser.add_argument('--print_train', action='store_true', default=True)
+parser.add_argument('--print_train_freq', type=int, default=1)
+parser.add_argument('--print_eval', action='store_true', default=True)
+parser.add_argument('--print_eval_freq', type=int, default=100)
+parser.add_argument('--moving_mean_decay', type=float, default=0.99)
 default_hparams = parser.parse_args()
 
 
-def loss_fn(predictions, tails):
+def loss_fn(prediction, tails):
     """ predictions: (tf.Tensor) batch_size x n_nodes
         tails: (np.array) batch_size
     """
     pred_idx = tf.stack([tf.range(0, len(tails)), tails], axis=1)  # batch_size x 2
-    pred_prob = tf.gather_nd(predictions, pred_idx)  # batch_size
+    pred_prob = tf.gather_nd(prediction, pred_idx)  # batch_size
     pred_loss = tf.reduce_mean(- tf.math.log(pred_prob + 1e-20))
     return pred_loss
 
@@ -1319,13 +1693,20 @@ class Trainer(object):
         self.train_loss = None
         self.train_accuracy = None
 
-    def train_step(self, heads, tails, rels, tc=None):
+    def train_step(self, heads, tails, rels, epoch, tc=None):
         with tf.GradientTape() as tape:
-            hidden_uncon, hidden_con, node_attention = self.model.initialize(heads, rels, tc=tc)
-            for step in range(1, self.hparams.max_steps + 1):
-                hidden_uncon, hidden_con, node_attention = self.model.flow(hidden_uncon, hidden_con, node_attention, tc=tc)
+            predictions = []
+            for i in range(self.hparams.n_rollouts_for_train):
+                hidden_uncon, hidden_con, node_attention, query_context = \
+                    self.model.initialize(heads, rels, epoch, tc=tc)
 
-            prediction = node_attention  # batch_size x n_nodes
+                for step in range(1, self.hparams.max_steps + 1):
+                    hidden_uncon, hidden_con, node_attention = \
+                        self.model.flow(hidden_uncon, hidden_con, node_attention, query_context, epoch, tc=tc)
+                predictions.append(node_attention)
+
+            prediction = tf.reduce_mean(tf.stack(predictions, axis=2), axis=2)  # batch_size x n_nodes
+
             pred_loss = loss_fn(prediction, tails)
             reg_loss = self.model.regularization_loss
             loss = pred_loss + reg_loss
@@ -1364,17 +1745,23 @@ class Evaluator(object):
         self.eval_loss = None
         self.eval_accuracy = None
 
-    def eval_step(self, heads, tails, rels):
-        hidden_uncon, hidden_con, node_attention = self.model.initialize(heads, rels)
-        for step in range(1, self.hparams.max_steps + 1):
-            hidden_uncon, hidden_con, node_attention = self.model.flow(hidden_uncon, hidden_con, node_attention)
+    def eval_step(self, heads, tails, rels, epoch):
+        predictions = []
+        for i in range(self.hparams.n_rollouts_for_eval):
+            hidden_uncon, hidden_con, node_attention, query_context = self.model.initialize(heads, rels, epoch)
+
+            for step in range(1, self.hparams.max_steps + 1):
+                hidden_uncon, hidden_con, node_attention = \
+                    self.model.flow(hidden_uncon, hidden_con, node_attention, query_context, epoch)
+            predictions.append(node_attention)
+
+        prediction = tf.reduce_mean(tf.stack(predictions, axis=2), axis=2)  # batch_size x n_nodes
 
         self.heads.append(heads)
         self.relations.append(rels)
-        self.predictions.append(node_attention.numpy())
+        self.predictions.append(prediction.numpy())
         self.targets.append(tails)
 
-        prediction = node_attention
         pred_loss = loss_fn(prediction, tails)
         reg_loss = self.model.regularization_loss
         loss = pred_loss + reg_loss
@@ -1459,7 +1846,8 @@ def run(dataset, hparams):
     data_env = DataEnv(dataset, hparams)
     model = Model(data_env.graph, hparams)
     trainer = Trainer(model, hparams)
-    evaluator = Evaluator(model, data_env, hparams)
+    valid_evaluator = Evaluator(model, data_env, hparams)
+    test_evaluator = Evaluator(model, data_env, hparams)
 
     train_batcher = data_env.get_train_batcher()
     valid_batcher = data_env.get_valid_batcher()
@@ -1473,60 +1861,76 @@ def run(dataset, hparams):
         for train_batch, batch_size in train_batcher(hparams.batch_size):
             t0 = time.time()
             time_cost = reset_time_cost(hparams)
-            heads, tails, rels = np.split(train_batch, 3, axis=1)
-            cur_train_loss, cur_accuracy, train_loss, accuracy = trainer.train_step(heads, tails, rels, tc=time_cost)
+            heads, tails, rels = train_batch[:, 0], train_batch[:, 1], train_batch[:, 2]
+            cur_train_loss, cur_accuracy, train_loss, accuracy = trainer.train_step(heads, tails, rels, epoch, tc=time_cost)
             dt = time.time() - t0
 
             if hparams.print_train and batch_i % hparams.print_train_freq == 0:
-                print('[TRAIN] {:d}, {:d} | tr_ls: {:.4f} ({:.4f})| acc: {:.4f} ({:.4f}) |'
-                      ' t: {:.4f} | {}'.format(epoch, batch_i,
-                                               train_loss, cur_train_loss, accuracy, cur_accuracy,
-                                               dt, str_time_cost(time_cost)))
+                print('[TRAIN] {:d}, {:d} | loss: {:.4f} ({:.4f}) | acc: {:.4f} ({:.4f}) | time: {:.4f} {}'.format(
+                    epoch, batch_i, train_loss, cur_train_loss, accuracy, cur_accuracy, dt, str_time_cost(time_cost)))
 
             if hparams.print_eval and batch_i % hparams.print_eval_freq == 0:
                 try:
                     valid_batch, batch_size = next(valid_batch_gen)
-                    t0 = time.time()
-                    heads, tails, rels = np.
                 except StopIteration:
                     valid_batch_gen = valid_batcher(hparams.batch_size)
+                    valid_batch, batch_size = next(valid_batch_gen)
+                t0 = time.time()
+                heads, tails, rels = valid_batch[:, 0], valid_batch[:, 1], valid_batch[:, 2]
+                cur_eval_loss, cur_accuracy, eval_loss, accuracy = valid_evaluator.eval_step(heads, tails, rels, epoch)
+                dt = time.time() - t0
+
+                print('[VALID] {:d}, {:d} | loss: {:.4f} ({:.4f}) | acc: {:.4f} ({:.4f}) | time: {:.4f}'.format(
+                    epoch, batch_i, eval_loss, cur_eval_loss, accuracy, cur_accuracy, dt))
 
                 try:
                     test_batch, batch_size = next(test_batch_gen)
                 except StopIteration:
                     test_batch_gen = test_batcher(hparams.batch_size)
+                    test_batch, batch_size = next(test_batch_gen)
+                t0 = time.time()
+                heads, tails, rels = test_batch[:, 0], test_batch[:, 1], test_batch[:, 2]
+                cur_eval_loss, cur_accuracy, eval_loss, accuracy = test_evaluator.eval_steps(heads, tails, rels, epoch)
+                dt = time.time() - t0
+
+                print('[TEST] {:d}, {:d} | loss: {:.4f} ({:.4f}) | acc: {:.4f} ({:.4f}) | time: {:.4f}'.format(
+                    epoch, batch_i, eval_loss, cur_eval_loss, accuracy, cur_accuracy, dt))
 
             batch_i += 1
 
-        evaluator.reset_metric()
-        valid_batcher = data_env.get_valid_batcher()
+        valid_evaluator.reset_metric()
         batch_i = 1
         for valid_batch, batch_size in valid_batcher(hparams.batch_size):
             t0 = time.time()
-            time_cost = reset_time_cost(hparams)
-
             heads, tails, rels = valid_batch[:, 0], valid_batch[:, 1], valid_batch[:, 2]
-            cur_eval_loss, cur_pred_loss, cur_accuracy = evaluator.eval_step(heads, tails, rels)
-
-            eval_loss, pred_loss, accuracy = evaluator.metric_result()
+            cur_eval_loss, cur_accuracy, eval_loss, accuracy = valid_evaluator.eval_step(heads, tails, rels)
             dt = time.time() - t0
 
             if hparams.print_eval:
-                print('[EVAL] {:d}, {:d} | ev_ls: {:.4f} ({:.4f}) | pr_ls: {:.4f} ({:.4f}) | acc: {:.4f} ({:.4f}) |'
-                      ' t: {:3f} | {}'.format(epoch, batch_i,
-                                              eval_loss.numpy(), cur_eval_loss,
-                                              pred_loss.numpy(), cur_pred_loss,
-                                              accuracy.numpy(), cur_accuracy,
-                                              dt,
-                                              str_time_cost(time_cost)))
+                print('[FULL VALID] {:d}, {:d} | loss: {:.4f} ({:.4f}) | acc: {:.4f} ({:.4f}) | time: {:.4f}'.format(
+                    epoch, batch_i, eval_loss, cur_eval_loss, accuracy, cur_accuracy, dt))
             batch_i += 1
 
-        hit_1, hit_3, hit_5, hit_10, mr, mrr, max_r = evaluator.final_metric_result()
-        print('epoch: {:d} | hit_1: {:.6f} | hit_3: {:.6f} | hit_5: {:.6f} | hit_10: {:.6f} | mr: {:.1f} | mmr: {:6f} | '
-              'max_r: {:1f}'
-              .format(epoch, hit_1, hit_3, hit_5, hit_10, mr, mrr, max_r))
+        hit_1, hit_3, hit_5, hit_10, mr, mrr, max_r = valid_evaluator.metric_result()
+        print('[REPORT VALID] {:d} | hit_1: {:.6f} | hit_3: {:.6f} | hit_5: {:.6f} | hit_10: {:.6f} | '
+              'mr: {:.1f} | mmr: {:.6f} | max_r: {:1f}'.format(epoch, hit_1, hit_3, hit_5, hit_10, mr, mrr, max_r))
 
-        # test_batcher = data_env.get_test_batcher()
+        test_evaluator.reset_metric()
+        batch_i = 1
+        for test_batch, batch_size in test_batcher(hparams.batch_size):
+            t0 = time.time()
+            heads, tails, rels = test_batch[:, 0], test_batch[:, 1], test_batch[:, 2]
+            cur_eval_loss, cur_accuracy, eval_loss, accuracy = test_evaluator.eval_step(heads, tails, rels)
+            dt = time.time() - t0
+
+            if hparams.print_eval:
+                print('[FULL TEST] {:d}, {:d} | loss: {:.4f} ({:.4f}) | acc: {:.4f} ({:.4f}) | time: {:.4f}'.format(
+                    epoch, batch_i, eval_loss, cur_eval_loss, accuracy, cur_accuracy, dt))
+                batch_i += 1
+
+            hit_1, hit_3, hit_5, hit_10, mr, mrr, max_r = test_evaluator.metric_result()
+            print('[REPORT TEST] {:d} | hit_1: {:.6f} | hit_3: {:.6f} | hit_5: {:.6f} | hit_10: {:.6f} | '
+                  'mr: {:.1f} | mmr: {:.6f} | max_r: {:1f}'.format(epoch, hit_1, hit_3, hit_5, hit_10, mr, mrr, max_r))
 
 
 if __name__ == '__main__':
@@ -1534,10 +1938,4 @@ if __name__ == '__main__':
     print(hparams)
 
     dataset = getattr(datasets, hparams.dataset)()
-
     run(dataset, hparams)
-
-    #for max_steps in range(2,21):
-    #    print('max_step: {}'.format(max_steps))
-    #    hparams.max_steps = max_steps
-    #    run(dataset, hparams)
