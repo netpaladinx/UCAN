@@ -63,8 +63,9 @@ class Graph(object):
         self.memorized_nodes = None  # (np.array) (eg_idx, v) sorted by ed_idx, v
         self.memorized_node_atts = None  # (np.array) (v_att,) listed according to `memorized_nodes`
 
-        self.node_attention_li = None
-        self.attend_nodes_li = None
+        self.inputs_history = []
+        self.node_attention_history = []
+        self.attend_nodes_history = []
 
     def _add_virtual_edges(self, n_clusters, n_clustering, connected_clustering, n_ents, n_rels):
         """ `n_ents`: all real nodes in `train` + `valid` + `test`
@@ -256,11 +257,12 @@ class Graph(object):
         # topk_nodes: (np.array) n_topk_nodes x 2, (eg_idx, vi) sorted
         return topk_nodes
 
-    def set_node_attention_li(self, node_attention):
-        self.node_attention_li = [node_attention.numpy()]
+    def add_inputs(self, inputs, epoch, batch_i):
+        self.inputs_history.append((epoch, batch_i, inputs))
 
-    def set_attended_nodes_li(self):
-        self.attend_nodes_li = []
+    def set_init(self, node_attention, epoch, batch_i):
+        self.node_attention_history.append([epoch, batch_i, node_attention.numpy()])
+        self.attend_nodes_history.append([epoch, batch_i])
 
     def get_selfloop_and_backtrace(self, attended_nodes, max_backtrace_nodes, tc=None):
         """ attended_nodes: (np.array) n_attended_nodes x 2, (eg_idx, vi) sorted
@@ -272,7 +274,7 @@ class Graph(object):
         selfloop_edges = np.stack([eg_idx, vi, vi, np.repeat(np.array(self.selfloop, dtype='int32'), eg_idx.shape[0])],
                                   axis=1)  # (eg_idx, vi, vi, selfloop)
 
-        if self.memorized_nodes is None:
+        if self.memorized_nodes is None or max_backtrace_nodes == 0:
             return selfloop_edges, None
 
         backtrace_idx = groupby_1cols_nlargest(self.memorized_nodes[:, 0], self.memorized_node_atts, max_backtrace_nodes)
@@ -321,11 +323,9 @@ class Graph(object):
         # aug_scanned_edges: n_aug_scanned_edges x 6, (eg_idx, vi, vj, rel, idx_vi, idx_vj) sorted by (eg_idx, vi, vj)
         return aug_scanned_edges, new_idx_for_edges_y, rest_idx
 
-    def add_node_attention(self, node_attention):
-        self.node_attention_li.append(node_attention.numpy())
-
-    def add_attended_nodes(self, attended_nodes):
-        self.attend_nodes_li.append(attended_nodes)
+    def add_flow(self, node_attention, attended_nodes):
+        self.node_attention_history[-1].append(node_attention.numpy())
+        self.attend_nodes_history[-1].append(attended_nodes)
 
     def add_nodes_to_memorized(self, selected_edges, node_attention=None, backtrace_decay=1., inplace=False, tc=None):
         """ selected_edges: (np.array) n_selected_edges x 6, (eg_idx, vi, vj, rel, idx_vi, idx_vj) sorted by (eg_idx, vi, vj)
@@ -421,7 +421,7 @@ class Graph(object):
 
 
 class DataFeeder(object):
-    def get_train_batch(self, train_data, graph, batch_size,shuffle=True):
+    def get_train_batch(self, train_data, graph, batch_size, shuffle=True):
         n_train = len(train_data)
         rand_idx = np.random.permutation(n_train) if shuffle else np.arange(n_train)
         start = 0
@@ -465,7 +465,7 @@ class DataEnv(object):
             self.filter_pool[(head, rel)].add(tail)
 
     def get_train_batcher(self):
-        return partial(self.data_feeder.get_train_batch, self.graph.train, self.graph, shuffle=False)
+        return partial(self.data_feeder.get_train_batch, self.graph.train, self.graph)
 
     def get_valid_batcher(self):
         return partial(self.data_feeder.get_eval_batch, self.valid, self.graph)
@@ -1380,7 +1380,7 @@ class Model(object):
         else:
             return hparam[int(len(hparam) * (epoch - 1) / self.hparams.max_epochs)]
 
-    def initialize(self, heads, rels, epoch, tc=None):
+    def initialize(self, heads, rels, epoch, batch_i, tc=None):
         """ heads: batch_size
             rels: batch_size
         """
@@ -1422,8 +1422,7 @@ class Model(object):
         memorized_v = self.graph.set_init_memorized_nodes(heads)  # n_memorized_nodes (=batch_size) x 2, (eg_idx, v)
         hidden_con = self.con_flow.get_init_hidden(hidden_uncon, memorized_v)  # n_memorized_nodes x n_dims
 
-        self.graph.set_node_attention_li(node_attention)
-        self.graph.set_attended_nodes_li()
+        self.graph.set_init(node_attention, epoch, batch_i)
 
         # hidden_uncon: 1 x n_nodes x n_dims_lg
         # hidden_con: n_memorized_nodes x n_dims
@@ -1556,8 +1555,7 @@ class Model(object):
                                        tc=get(tc, 'model'))  # n_memorized_nodes (new) x n_dims
 
         ''' do storing work at the end of each step '''
-        self.graph.add_node_attention(new_node_attention)
-        self.graph.add_attended_nodes(attended_nodes)
+        self.graph.add_flow(new_node_attention, attended_nodes)
 
         # new_hidden_uncon: 1 x n_nodes x n_dims_lg,
         # new_hidden_con: n_memorized_nodes x n_dims,
@@ -1580,137 +1578,10 @@ class Model(object):
 
 """ run.py """
 
+import config_C as config
+
 parser = argparse.ArgumentParser()
-
-# FB237
-"""
-parser.add_argument('-bs', '--batch_size', type=int, default=100)
-parser.add_argument('--n_dims_sm', type=int, default=10)
-parser.add_argument('--n_dims', type=int, default=100)
-parser.add_argument('--n_dims_lg', type=int, default=500)
-parser.add_argument('--ent_emb_l2', type=float, default=0.)
-parser.add_argument('--rel_emb_l2', type=float, default=0.)
-parser.add_argument('--query_fn', default='f > g_ng')
-parser.add_argument('--uncon_message_fn', default='f > g_ng')
-parser.add_argument('--uncon_hidden_fn', default='f > g_ng')
-parser.add_argument('--con_message_fn', default='f > g_ng')
-parser.add_argument('--con_hidden_fn', default='f > g_ng')
-parser.add_argument('--transition_fn', default='scorer')
-parser.add_argument('--use_tanh_for_logits', action='store_true', default=False)
-parser.add_argument('--diff_control_for_sampling', nargs=3, type=float, default=[1,2,3])
-parser.add_argument('--diff_control_for_transition', nargs=3, type=float, default=[1,2,3])
-parser.add_argument('--straight_through', action='store_true', default=True)
-parser.add_argument('--norm_mode', default='tanh')
-parser.add_argument('--norm_mix', type=float, default=0.5)
-parser.add_argument('--max_edges_per_example', type=int, default=10000)
-parser.add_argument('--max_attended_nodes', type=int, default=10)
-parser.add_argument('--max_edges_per_node', type=int, default=100)
-parser.add_argument('--max_backtrace_nodes', type=int, default=10)
-parser.add_argument('--backtrace_decay', type=float, default=1.)
-parser.add_argument('--max_seen_nodes', type=int, default=100)
-parser.add_argument('--max_epochs', type=int, default=10)
-parser.add_argument('--n_clustering', type=int, default=0)
-parser.add_argument('--n_clusters_per_clustering', type=int, default=0)
-parser.add_argument('--connected_clustering', action='store_true', default=True)
-parser.add_argument('--init_uncon_steps', type=int, default=1)
-parser.add_argument('--simultaneous_uncon_flow', action='store_true', default=False)
-parser.add_argument('--max_steps', type=int, default=5)
-parser.add_argument('--n_rollouts_for_train', type=int, default=1)
-parser.add_argument('--n_rollouts_for_eval', type=int, default=1)
-parser.add_argument('--learning_rate', type=float, default=0.005)
-parser.add_argument('--dataset', default='FB237')
-parser.add_argument('--timer', action='store_true', default=False)
-parser.add_argument('--print_train', action='store_true', default=True)
-parser.add_argument('--print_train_freq', type=int, default=1)
-parser.add_argument('--print_eval', action='store_true', default=True)
-parser.add_argument('--print_eval_freq', type=int, default=100)
-parser.add_argument('--moving_mean_decay', type=float, default=0.99)
-"""
-"""
-parser.add_argument('-bs', '--batch_size', type=int, default=100)
-parser.add_argument('--n_dims_sm', type=int, default=20)
-parser.add_argument('--n_dims', type=int, default=100)
-parser.add_argument('--n_dims_lg', type=int, default=500)
-parser.add_argument('--ent_emb_l2', type=float, default=0.)
-parser.add_argument('--rel_emb_l2', type=float, default=0.)
-parser.add_argument('--query_fn', default='f > g_wg > f_cond > g_wg')
-parser.add_argument('--uncon_message_fn', default='f > g_wg > f_cond > g_wg')
-parser.add_argument('--uncon_hidden_fn', default='f > g_wg > f_cond > g_wg')
-parser.add_argument('--con_message_fn', default='f > g_wg > f_cond > g_wg')
-parser.add_argument('--con_hidden_fn', default='f > g_wg > f_cond > g_wg')
-parser.add_argument('--transition_fn', default='f > g_wg > scorer_cond')
-parser.add_argument('--use_tanh_for_logits', action='store_true', default=False)
-parser.add_argument('--diff_control_for_sampling', nargs=3, type=float, default=[1,2,3])
-parser.add_argument('--diff_control_for_transition', nargs=3, type=float, default=[1,2,3])
-parser.add_argument('--straight_through', action='store_true', default=True)
-parser.add_argument('--norm_mode', default='mix')
-parser.add_argument('--norm_mix', type=float, default=0.5)
-parser.add_argument('--max_edges_per_example', type=int, default=10000)
-parser.add_argument('--max_attended_nodes', type=int, default=10)
-parser.add_argument('--max_edges_per_node', type=int, default=100)
-parser.add_argument('--max_backtrace_nodes', type=int, default=10)
-parser.add_argument('--backtrace_decay', type=float, default=1.)
-parser.add_argument('--max_seen_nodes', type=int, default=100)
-parser.add_argument('--max_epochs', type=int, default=10)
-parser.add_argument('--n_clustering', type=int, default=0)
-parser.add_argument('--n_clusters_per_clustering', type=int, default=0)
-parser.add_argument('--connected_clustering', action='store_true', default=True)
-parser.add_argument('--init_uncon_steps', type=int, default=3)
-parser.add_argument('--simultaneous_uncon_flow', action='store_true', default=False)
-parser.add_argument('--max_steps', type=int, default=5)
-parser.add_argument('--n_rollouts_for_train', type=int, default=1)
-parser.add_argument('--n_rollouts_for_eval', type=int, default=5)
-parser.add_argument('--learning_rate', type=float, default=0.005)
-parser.add_argument('--dataset', default='FB237')
-parser.add_argument('--timer', action='store_true', default=False)
-parser.add_argument('--print_train', action='store_true', default=True)
-parser.add_argument('--print_train_freq', type=int, default=1)
-parser.add_argument('--print_eval', action='store_true', default=True)
-parser.add_argument('--print_eval_freq', type=int, default=100)
-parser.add_argument('--moving_mean_decay', type=float, default=0.99)
-"""
-parser.add_argument('-bs', '--batch_size', type=int, default=20)
-parser.add_argument('--n_dims_sm', type=int, default=10)
-parser.add_argument('--n_dims', type=int, default=100)
-parser.add_argument('--n_dims_lg', type=int, default=100)
-parser.add_argument('--ent_emb_l2', type=float, default=0.)
-parser.add_argument('--rel_emb_l2', type=float, default=0.)
-parser.add_argument('--query_fn', default='f > g_ng')
-parser.add_argument('--uncon_message_fn', default='f > g_ng')
-parser.add_argument('--uncon_hidden_fn', default='f > g_ng')
-parser.add_argument('--con_message_fn', default='f > g_ng')
-parser.add_argument('--con_hidden_fn', default='f > g_ng')
-parser.add_argument('--transition_fn', default='scorer')
-parser.add_argument('--use_tanh_for_logits', action='store_true', default=False)
-parser.add_argument('--diff_control_for_sampling', nargs=3, type=float, default=[1,2,3])
-parser.add_argument('--diff_control_for_transition', nargs=3, type=float, default=[1,2,3])
-parser.add_argument('--straight_through', action='store_true', default=True)
-parser.add_argument('--norm_mode', default='tanh')
-parser.add_argument('--norm_mix', type=float, default=0.5)
-parser.add_argument('--max_edges_per_example', type=int, default=1000)
-parser.add_argument('--max_attended_nodes', type=int, default=2)
-parser.add_argument('--max_edges_per_node', type=int, default=10)
-parser.add_argument('--max_backtrace_nodes', type=int, default=5)
-parser.add_argument('--backtrace_decay', type=float, default=1.)
-parser.add_argument('--max_seen_nodes', type=int, default=10)
-parser.add_argument('--max_epochs', type=int, default=10)
-parser.add_argument('--n_clustering', type=int, default=0)
-parser.add_argument('--n_clusters_per_clustering', type=int, default=0)
-parser.add_argument('--connected_clustering', action='store_true', default=True)
-parser.add_argument('--init_uncon_steps', type=int, default=2)
-parser.add_argument('--simultaneous_uncon_flow', action='store_true', default=False)
-parser.add_argument('--max_steps', type=int, default=3)
-parser.add_argument('--n_rollouts_for_train', type=int, default=1)
-parser.add_argument('--n_rollouts_for_eval', type=int, default=1)
-parser.add_argument('--learning_rate', type=float, default=0.005)
-parser.add_argument('--dataset', default='Countries')
-parser.add_argument('--timer', action='store_true', default=False)
-parser.add_argument('--print_train', action='store_true', default=True)
-parser.add_argument('--print_train_freq', type=int, default=1)
-parser.add_argument('--print_eval', action='store_true', default=True)
-parser.add_argument('--print_eval_freq', type=int, default=100)
-parser.add_argument('--moving_mean_decay', type=float, default=0.99)
-
+parser = config.get_toy1_config(parser)
 default_hparams = parser.parse_args()
 
 
@@ -1724,21 +1595,63 @@ def loss_fn(prediction, tails):
     return pred_loss
 
 
+def calc_metric(heads, relations, prediction, targets, filter_pool):
+    hit_1, hit_3, hit_5, hit_10, mr, mrr, max_r = 0., 0., 0., 0., 0., 0., 0.
+
+    n_preds = prediction.shape[0]
+    for i in range(n_preds):
+        head = heads[i]
+        rel = relations[i]
+        tar = targets[i]
+        pred = prediction[i]
+        fil = list(filter_pool[(head, rel)] - {tar})
+
+        sorted_idx = np.argsort(-pred)
+        mask = np.logical_not(np.isin(sorted_idx, fil))
+        sorted_idx = sorted_idx[mask]
+
+        rank = np.where(sorted_idx == tar)[0].item() + 1
+
+        if rank <= 1:
+            hit_1 += 1
+        if rank <= 3:
+            hit_3 += 1
+        if rank <= 5:
+            hit_5 += 1
+        if rank <= 10:
+            hit_10 += 1
+        mr += rank
+        mrr += 1. / rank
+        max_r = max(max_r, rank)
+
+    hit_1 /= n_preds
+    hit_3 /= n_preds
+    hit_5 /= n_preds
+    hit_10 /= n_preds
+    mr /= n_preds
+    mrr /= n_preds
+
+    return hit_1, hit_3, hit_5, hit_10, mr, mrr, max_r
+
+
 class Trainer(object):
-    def __init__(self, model, hparams):
+    def __init__(self, model, data_env, hparams):
         self.model = model
+        self.data_env = data_env
         self.hparams = hparams
         self.optimizer = keras.optimizers.Adam(learning_rate=hparams.learning_rate)
 
         self.train_loss = None
         self.train_accuracy = None
 
-    def train_step(self, heads, tails, rels, epoch, tc=None):
+    def train_step(self, heads, tails, rels, epoch, batch_i, tc=None):
         with tf.GradientTape() as tape:
             predictions = []
             for i in range(self.hparams.n_rollouts_for_train):
+                self.model.graph.add_inputs(np.stack([heads, rels, tails], axis=1), epoch, batch_i)
+
                 hidden_uncon, hidden_con, node_attention, query_context = \
-                    self.model.initialize(heads, rels, epoch, tc=tc)
+                    self.model.initialize(heads, rels, epoch, batch_i, tc=tc)
 
                 for step in range(1, self.hparams.max_steps + 1):
                     hidden_uncon, hidden_con, node_attention = \
@@ -1768,7 +1681,11 @@ class Trainer(object):
         accuracy = tf.reduce_mean(tf.cast(tf.equal(tf.argmax(prediction, axis=1), tails), tf.float32))
         self.train_accuracy = accuracy if self.train_accuracy is None else self.train_accuracy * decay + accuracy * (1 - decay)
 
-        return loss.numpy(), accuracy.numpy(), self.train_loss.numpy(), self.train_accuracy.numpy()
+        train_metric = None
+        if self.hparams.print_train_metric:
+            train_metric = calc_metric(heads, rels, prediction, tails, self.data_env.filter_pool)
+
+        return loss.numpy(), accuracy.numpy(), self.train_loss.numpy(), self.train_accuracy.numpy(), train_metric
 
 
 class Evaluator(object):
@@ -1779,16 +1696,18 @@ class Evaluator(object):
 
         self.heads = []
         self.relations = []
-        self.predictions = []
+        self.prediction = []
         self.targets = []
 
         self.eval_loss = None
         self.eval_accuracy = None
 
-    def eval_step(self, heads, tails, rels, epoch):
+    def eval_step(self, heads, tails, rels, epoch, batch_i):
         predictions = []
         for i in range(self.hparams.n_rollouts_for_eval):
-            hidden_uncon, hidden_con, node_attention, query_context = self.model.initialize(heads, rels, epoch)
+            self.model.graph.add_inputs(np.stack([heads, tails, rels], axis=1), epoch, batch_i)
+
+            hidden_uncon, hidden_con, node_attention, query_context = self.model.initialize(heads, rels, epoch, batch_i)
 
             for step in range(1, self.hparams.max_steps + 1):
                 hidden_uncon, hidden_con, node_attention = \
@@ -1799,7 +1718,7 @@ class Evaluator(object):
 
         self.heads.append(heads)
         self.relations.append(rels)
-        self.predictions.append(prediction.numpy())
+        self.prediction.append(prediction.numpy())
         self.targets.append(tails)
 
         pred_loss = loss_fn(prediction, tails)
@@ -1816,53 +1735,15 @@ class Evaluator(object):
     def reset_metric(self):
         self.heads = []
         self.relations = []
-        self.predictions = []
+        self.prediction = []
         self.targets = []
 
     def metric_result(self):
         heads = np.concatenate(self.heads, axis=0)
         relations = np.concatenate(self.relations, axis=0)
-        predictions = np.concatenate(self.predictions, axis=0)
+        prediction = np.concatenate(self.prediction, axis=0)
         targets = np.concatenate(self.targets, axis=0)
-        return self._calc_metrics(heads, relations, predictions, targets, self.data_env.filter_pool)
-
-    def _calc_metrics(self, heads, relations, predictions, targets, filter_pool):
-        hit_1, hit_3, hit_5, hit_10, mr, mrr, max_r = 0., 0., 0., 0., 0., 0., 0.
-
-        n_preds = predictions.shape[0]
-        for i in range(n_preds):
-            head = heads[i]
-            rel = relations[i]
-            tar = targets[i]
-            pred = predictions[i]
-            fil = list(filter_pool[(head, rel)] - {tar})
-
-            sorted_idx = np.argsort(-pred)
-            mask = np.logical_not(np.isin(sorted_idx, fil))
-            sorted_idx = sorted_idx[mask]
-
-            rank = np.where(sorted_idx == tar)[0].item() + 1
-
-            if rank <= 1:
-                hit_1 += 1
-            if rank <= 3:
-                hit_3 += 1
-            if rank <= 5:
-                hit_5 += 1
-            if rank <= 10:
-                hit_10 += 1
-            mr += rank
-            mrr += 1. / rank
-            max_r = max(max_r, rank)
-
-        hit_1 /= n_preds
-        hit_3 /= n_preds
-        hit_5 /= n_preds
-        hit_10 /= n_preds
-        mr /= n_preds
-        mrr /= n_preds
-
-        return hit_1, hit_3, hit_5, hit_10, mr, mrr, max_r
+        return calc_metric(heads, relations, prediction, targets, self.data_env.filter_pool)
 
 
 def reset_time_cost(hparams):
@@ -1885,7 +1766,7 @@ def str_time_cost(tc):
 def run(dataset, hparams):
     data_env = DataEnv(dataset, hparams)
     model = Model(data_env.graph, hparams)
-    trainer = Trainer(model, hparams)
+    trainer = Trainer(model, data_env, hparams)
     valid_evaluator = Evaluator(model, data_env, hparams)
     test_evaluator = Evaluator(model, data_env, hparams)
 
@@ -1901,13 +1782,23 @@ def run(dataset, hparams):
         for train_batch, batch_size in train_batcher(hparams.batch_size):
             t0 = time.time()
             time_cost = reset_time_cost(hparams)
+
             heads, tails, rels = train_batch[:, 0], train_batch[:, 1], train_batch[:, 2]
-            cur_train_loss, cur_accuracy, train_loss, accuracy = trainer.train_step(heads, tails, rels, epoch, tc=time_cost)
+            cur_train_loss, cur_accuracy, train_loss, accuracy, train_metric = trainer.train_step(
+                heads, tails, rels, epoch, batch_i, tc=time_cost)
+
             dt = time.time() - t0
 
             if hparams.print_train and batch_i % hparams.print_train_freq == 0:
-                print('[TRAIN] {:d}, {:d} | loss: {:.4f} ({:.4f}) | acc: {:.4f} ({:.4f}) | time: {:.4f} {}'.format(
-                    epoch, batch_i, train_loss, cur_train_loss, accuracy, cur_accuracy, dt, str_time_cost(time_cost)))
+                if hparams.print_train_metric:
+                    hit_1, hit_3, hit_5, hit_10, mr, mrr, max_r = train_metric
+                    print('[TRAIN] {:d}, {:d} | loss: {:.4f} ({:.4f}) | acc: {:.4f} ({:.4f}) | time: {:.4f} {} | '
+                          'hit_1: {:.4f} | hit_10: {:.4f} | mr: {:.1f} | mmr: {:.4f} | max_r: {:.1f}'.format(
+                        epoch, batch_i, train_loss, cur_train_loss, accuracy, cur_accuracy,
+                        dt, str_time_cost(time_cost), hit_1, hit_10, mr, mrr, max_r))
+                else:
+                    print('[TRAIN] {:d}, {:d} | loss: {:.4f} ({:.4f}) | acc: {:.4f} ({:.4f}) | time: {:.4f} {}'.format(
+                        epoch, batch_i, train_loss, cur_train_loss, accuracy, cur_accuracy, dt, str_time_cost(time_cost)))
 
             if hparams.print_eval and batch_i % hparams.print_eval_freq == 0:
                 try:
@@ -1916,8 +1807,11 @@ def run(dataset, hparams):
                     valid_batch_gen = valid_batcher(hparams.batch_size)
                     valid_batch, batch_size = next(valid_batch_gen)
                 t0 = time.time()
+
                 heads, tails, rels = valid_batch[:, 0], valid_batch[:, 1], valid_batch[:, 2]
-                cur_eval_loss, cur_accuracy, eval_loss, accuracy = valid_evaluator.eval_step(heads, tails, rels, epoch)
+                cur_eval_loss, cur_accuracy, eval_loss, accuracy = valid_evaluator.eval_step(
+                    heads, tails, rels, epoch, batch_i)
+
                 dt = time.time() - t0
 
                 print('[VALID] {:d}, {:d} | loss: {:.4f} ({:.4f}) | acc: {:.4f} ({:.4f}) | time: {:.4f}'.format(
@@ -1929,8 +1823,11 @@ def run(dataset, hparams):
                     test_batch_gen = test_batcher(hparams.batch_size)
                     test_batch, batch_size = next(test_batch_gen)
                 t0 = time.time()
+
                 heads, tails, rels = test_batch[:, 0], test_batch[:, 1], test_batch[:, 2]
-                cur_eval_loss, cur_accuracy, eval_loss, accuracy = test_evaluator.eval_step(heads, tails, rels, epoch)
+                cur_eval_loss, cur_accuracy, eval_loss, accuracy = test_evaluator.eval_step(
+                    heads, tails, rels, epoch, batch_i)
+
                 dt = time.time() - t0
 
                 print('[TEST] {:d}, {:d} | loss: {:.4f} ({:.4f}) | acc: {:.4f} ({:.4f}) | time: {:.4f}'.format(
@@ -1942,8 +1839,11 @@ def run(dataset, hparams):
         batch_i = 1
         for valid_batch, batch_size in valid_batcher(hparams.batch_size):
             t0 = time.time()
+
             heads, tails, rels = valid_batch[:, 0], valid_batch[:, 1], valid_batch[:, 2]
-            cur_eval_loss, cur_accuracy, eval_loss, accuracy = valid_evaluator.eval_step(heads, tails, rels, epoch)
+            cur_eval_loss, cur_accuracy, eval_loss, accuracy = valid_evaluator.eval_step(
+                heads, tails, rels, epoch, batch_i)
+
             dt = time.time() - t0
 
             if hparams.print_eval:
@@ -1953,14 +1853,17 @@ def run(dataset, hparams):
 
         hit_1, hit_3, hit_5, hit_10, mr, mrr, max_r = valid_evaluator.metric_result()
         print('[REPORT VALID] {:d} | hit_1: {:.6f} | hit_3: {:.6f} | hit_5: {:.6f} | hit_10: {:.6f} | '
-              'mr: {:.1f} | mmr: {:.6f} | max_r: {:1f}'.format(epoch, hit_1, hit_3, hit_5, hit_10, mr, mrr, max_r))
+              'mr: {:.1f} | mmr: {:.6f} | max_r: {:.1f}'.format(epoch, hit_1, hit_3, hit_5, hit_10, mr, mrr, max_r))
 
         test_evaluator.reset_metric()
         batch_i = 1
         for test_batch, batch_size in test_batcher(hparams.batch_size):
             t0 = time.time()
+
             heads, tails, rels = test_batch[:, 0], test_batch[:, 1], test_batch[:, 2]
-            cur_eval_loss, cur_accuracy, eval_loss, accuracy = test_evaluator.eval_step(heads, tails, rels, epoch)
+            cur_eval_loss, cur_accuracy, eval_loss, accuracy = test_evaluator.eval_step(
+                heads, tails, rels, epoch, batch_i)
+
             dt = time.time() - t0
 
             if hparams.print_eval:
@@ -1970,8 +1873,9 @@ def run(dataset, hparams):
 
         hit_1, hit_3, hit_5, hit_10, mr, mrr, max_r = test_evaluator.metric_result()
         print('[REPORT TEST] {:d} | hit_1: {:.6f} | hit_3: {:.6f} | hit_5: {:.6f} | hit_10: {:.6f} | '
-              'mr: {:.1f} | mmr: {:.6f} | max_r: {:1f}'.format(epoch, hit_1, hit_3, hit_5, hit_10, mr, mrr, max_r))
+              'mr: {:.1f} | mmr: {:.6f} | max_r: {:.1f}'.format(epoch, hit_1, hit_3, hit_5, hit_10, mr, mrr, max_r))
 
+    print('DONE')
 
 if __name__ == '__main__':
     hparams = copy.deepcopy(default_hparams)

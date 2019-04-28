@@ -1385,7 +1385,7 @@ parser.add_argument('--simultaneous_uncon_flow', action='store_true', default=Fa
 parser.add_argument('--max_steps', type=int, default=10)
 #parser.add_argument('--step_weights', default='0.05,0.05,0.05,0.05,0.8')
 parser.add_argument('--learning_rate', type=float, default=0.01)
-parser.add_argument('--dataset', default='Countries')
+parser.add_argument('--dataset', default='Toy1')
 parser.add_argument('--timer', action='store_true', default=False)
 parser.add_argument('--print_train', action='store_true', default=True)
 parser.add_argument('--print_eval', action='store_true', default=False)

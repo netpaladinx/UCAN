@@ -273,18 +273,61 @@ def report_4(ds):
     pos = nx.spring_layout(graph)
     node_color = [float(graph.degree(v)) for v in graph]
     edge_color = [node_color[vi] + node_color[vj] for vi, vj in graph.edges]
+
     plt.figure(figsize=(24, 32))
 
     nx.draw_networkx_nodes(graph, pos, node_size=200, node_color=node_color, alpha=0.4)
     nx.draw_networkx_edges(graph, pos, alpha=0.3, edge_color=edge_color)
+
+    labels = {v: ds.id2entity[v] for v in graph}
+    nx.draw_networkx_labels(graph, pos, labels=labels, font_size=8)
+
+    plt.axis('off')
+    plt.savefig('graph_1.pdf')
+    plt.show()
+
+    plt.figure(figsize=(24, 32))
+
+    nx.draw_networkx_nodes(graph, pos, node_size=200, node_color=node_color, alpha=0.4)
+    nx.draw_networkx_edges(graph, pos, alpha=0.3, edge_color=edge_color)
+
     nx.draw_networkx_labels(graph, pos, font_size=8)
 
     plt.axis('off')
-    plt.savefig('countries.pdf')
+    plt.savefig('graph_2.pdf')
     plt.show()
 
+def report_5(ds):
+    graph = nx.DiGraph(ds.train[:, :2].tolist())
+    pos = nx.spring_layout(graph)
+    node_color = [float(graph.degree(v)) for v in graph]
+    edge_color = [node_color[vi] + node_color[vj] for vi, vj in graph.edges]
+
+    plt.figure(figsize=(24, 32))
+
+    nx.draw_networkx_nodes(graph, pos, node_size=80, node_color=node_color, alpha=0.3)
+    nx.draw_networkx_edges(graph, pos, alpha=0.1, edge_color=edge_color, arrowstyle='->', arrowsize=3)
+
+    labels = {v: ds.id2entity[v] for v in graph}
+    nx.draw_networkx_labels(graph, pos, labels=labels, font_size=4)
+
+    plt.axis('off')
+    plt.savefig('graph_1.pdf')
+    plt.show()
+
+    plt.figure(figsize=(24, 32))
+
+    nx.draw_networkx_nodes(graph, pos, node_size=80, node_color=node_color, alpha=0.3)
+    nx.draw_networkx_edges(graph, pos, alpha=0.3, edge_color=edge_color, arrowstyle='->', arrowsize=5)
+
+    nx.draw_networkx_labels(graph, pos, font_size=4)
+
+    plt.axis('off')
+    plt.savefig('graph_2.pdf')
+    plt.show()
 
 if __name__ == '__main__':
     #ds = datasets.FB237()
-    ds = datasets.Countries()
-    report_4(ds)
+    #ds = datasets.Countries()
+    ds = datasets.Toy1()
+    report_5(ds)

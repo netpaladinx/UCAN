@@ -108,3 +108,14 @@ class Countries(Dataset):
         valid_path = os.path.join(self.path, 'dev.txt')
         test_path = os.path.join(self.path, 'test.txt')
         super(Countries, self).__init__(train_path, valid_path, test_path, include_reverse=include_reverse)
+
+
+class Toy1(Dataset):
+    path = 'data/toy/toy1'
+
+    def __init__(self, include_reverse=True):
+        self.path = Toy1.path
+        train_path = os.path.join(self.path, 'train.txt')
+        valid_path = os.path.join(self.path, 'valid.txt')
+        test_path = os.path.join(self.path, 'test.txt')
+        super(Toy1, self).__init__(train_path, valid_path, test_path, include_reverse=include_reverse)
