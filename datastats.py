@@ -71,6 +71,7 @@ class DataStats(object):
         print('n_pairs_with_unseen_nodes: {}'.format(n_pairs_with_unseen_nodes))
         print('n_pairs_with_no_paths: {}'.format(n_pairs_with_no_paths))
 
+        """
         full_train = train_triples
         n_full_train = len(train_triples)
         n_train = len(test_triples)
@@ -118,6 +119,7 @@ class DataStats(object):
             graph_i += 1
 
             start = end
+        """
 
     def avg_shortest_path_length_report(self, train_triples):
         graph = nx.MultiDiGraph(train_triples[:, :2].tolist())
@@ -162,7 +164,7 @@ class DataStats(object):
 
         # print "Degree sequence", degree_sequence
         degreeCount = Counter(degree_sequence)
-        deg, cnt = zip(*degreeCount.items())
+        deg, cnt = zip(*filter(lambda x: x[0] < 50, degreeCount.items()))
 
         fig, ax = plt.subplots()
         plt.bar(deg, cnt, width=0.80, color='b')
@@ -175,11 +177,11 @@ class DataStats(object):
 
         # draw graph in inset
         plt.axes([0.4, 0.4, 0.5, 0.5])
-        Gcc = sorted(nx.connected_component_subgraphs(graph), key=len, reverse=True)[0]
-        pos = nx.spring_layout(graph)
+        #Gcc = sorted(nx.connected_component_subgraphs(graph), key=len, reverse=True)[0]
+        #pos = nx.spring_layout(graph)
         plt.axis('off')
-        nx.draw_networkx_nodes(graph, pos, node_size=20)
-        nx.draw_networkx_edges(graph, pos, alpha=0.4)
+        #nx.draw_networkx_nodes(graph, pos, node_size=20)
+        #nx.draw_networkx_edges(graph, pos, alpha=0.4)
 
         plt.show()
 
@@ -327,7 +329,7 @@ def report_5(ds):
     plt.show()
 
 if __name__ == '__main__':
-    #ds = datasets.FB237()
+    ds = datasets.FB237()
     #ds = datasets.Countries()
-    ds = datasets.Toy1()
-    report_5(ds)
+    #ds = datasets.Toy1()
+    report_1(ds)
