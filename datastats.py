@@ -254,6 +254,90 @@ class DataStats(object):
         print('max degree in train: {}'.format(deg_train_np[:, 2].max()))
         print()
 
+    def dataset_properties(self, graph_triples, eg_triples, is_train=True):
+        ht_dct = defaultdict(list)
+        htr_dct = defaultdict(int)
+        r_dct = defaultdict(int)
+        for h, t, r in graph_triples:
+            ht_dct[(h, t)].append(r)
+            htr_dct[(h, t, r)] += 1
+            r_dct[r] += 1
+
+        n_same_ht = 0
+        n_same_htr = 0
+        n_inverse_th = 0
+        n_inverse_thr = 0
+        n_total = 0
+        for h, t, r in eg_triples:
+            if (is_train and len(ht_dct[(h, t)]) > 1) or (not is_train and len(ht_dct[(h, t)]) > 0):
+                n_same_ht += 1
+            if (is_train and htr_dct[(h, t, r)] > 1) or (not is_train and htr_dct[(h, t, r)] > 0):
+                n_same_htr += 1
+            if len(ht_dct[(t, h)]) > 0:
+                n_inverse_th += 1
+            if htr_dct[(t, h, r)] > 0:
+                n_inverse_thr += 1
+            n_total += 1
+        print('n_same_ht: {:d} | n_same_htr: {:d} | n_inverse_th: {:d} | n_inverse_thr: {:d} | n_total: {:d}'.format(
+            n_same_ht, n_same_htr, n_inverse_th, n_inverse_thr, n_total))
+
+        r_set = set([r for _, _, r in eg_triples])
+        n_eg_with_r = 0
+        for r in r_set:
+            n_eg_with_r += r_dct[r]
+        print('n_rel_ratio: {:f} | n_eg_ratio: {:f} | n_eg_with_r_ratio: {:f}'.format(
+            len(r_set)/len(r_dct), len(eg_triples)/len(graph_triples), n_eg_with_r/len(graph_triples)))
+
+        full_edges = set([(h, t) for h, t, r in graph_triples])
+        n_pairs_with_unseen_nodes = 0
+        n_pairs_with_no_paths = 0
+        max_length = -1
+        min_length = -1
+        avg_length = 0
+        count = 0
+
+        graph = nx.Graph(list(full_edges))
+        for h, t, r in eg_triples:
+            if is_train:
+                if h <= t:
+                    graph.remove_edge(h, t)
+                else:
+                    graph.remove_edge(t, h)
+            try:
+                length = nx.algorithms.shortest_path_length(graph, source=h, target=t)
+                max_length = max(length, max_length) if max_length != -1 else length
+                min_length = min(length, min_length) if min_length != -1 else length
+                avg_length += length
+                count += 1
+            except nx.NodeNotFound:
+                n_pairs_with_unseen_nodes += 1
+            except nx.NetworkXNoPath:
+                n_pairs_with_no_paths += 1
+            if is_train:
+                if h <= t:
+                    graph.add_edge(h, t)
+                else:
+                    graph.add_edge(h, t)
+
+        avg_length = avg_length / count
+        print('avg_length: {}'.format(avg_length))
+        print('max_length: {}'.format(max_length))
+        print('min_length: {}'.format(min_length))
+        print('n_paris_with_paths: {}'.format(count))
+        print('n_pairs_with_unseen_nodes: {}'.format(n_pairs_with_unseen_nodes))
+        print('n_pairs_with_no_paths: {}'.format(n_pairs_with_no_paths))
+
+        avg_degree_h = 0
+        avg_degree_t = 0
+        for h, t, r in eg_triples:
+            if h in graph.nodes:
+                avg_degree_h += graph.degree[h]
+            if t in graph.nodes:
+                avg_degree_t += graph.degree[t]
+        avg_degree_h /= len(eg_triples)
+        avg_degree_t /= len(eg_triples)
+        print('avg_degree_h: {:f} | avg_degree_t: {:f}'.format(avg_degree_h, avg_degree_t))
+
 
 def report_1(ds):
     stats = DataStats()
@@ -271,7 +355,7 @@ def report_3(ds):
 
 
 def report_4(ds):
-    graph = nx.Graph(ds.train[:, :2].tolist())
+    graph = nx.Graph(ds.graph[:, :2].tolist())
     pos = nx.spring_layout(graph)
     node_color = [float(graph.degree(v)) for v in graph]
     edge_color = [node_color[vi] + node_color[vj] for vi, vj in graph.edges]
@@ -300,7 +384,7 @@ def report_4(ds):
     plt.show()
 
 def report_5(ds):
-    graph = nx.DiGraph(ds.train[:, :2].tolist())
+    graph = nx.DiGraph(ds.graph[:, :2].tolist())
     pos = nx.spring_layout(graph)
     node_color = [float(graph.degree(v)) for v in graph]
     edge_color = [node_color[vi] + node_color[vj] for vi, vj in graph.edges]
@@ -328,8 +412,16 @@ def report_5(ds):
     plt.savefig('graph_2.pdf')
     plt.show()
 
+def report_6(ds):
+    stats = DataStats()
+    print('\ntrain set:')
+    stats.dataset_properties(ds.graph, ds.train, is_train=True)
+    print('\nvalid set:')
+    stats.dataset_properties(ds.graph, ds.valid, is_train=False)
+    print('\ntest set:')
+    stats.dataset_properties(ds.graph, ds.test, is_train=False)
+
 if __name__ == '__main__':
-    ds = datasets.FB237()
-    #ds = datasets.Countries()
-    #ds = datasets.Toy1()
-    report_1(ds)
+    for ds in datasets.Nell995.datasets():
+        print(ds.name)
+        report_6(ds)
